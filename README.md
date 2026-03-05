@@ -23,20 +23,24 @@ It combines three tools in one app:
 ### 1) Product Map
 
 #### Home
+
 The home screen is a launch pad. It routes the user to each working area without mixing workflows.
 
 #### KlarityCheck
+
 `KlarityCheck` is the source-aware checker. It accepts pasted text or uploaded files (`.txt`, `.docx`, `.pdf`) and compares against fetched references.
 
 ![KlarityCheck placeholder](docs/images/klaritycheck-placeholder.svg)
 
 #### AuthentiText
+
 `AuthentiText` rewrites text in a selected tone (`Professional`, `Creative`, `Formal`, `Casual`).
 If `OPENAI_API_KEY` is present, it uses OpenAI. If not, it falls back to clear local messaging.
 
 ![AuthentiText placeholder](docs/images/authentitext-placeholder.svg)
 
 #### EduReplica
+
 `EduReplica` compares two local files directly (reference file vs research file).
 It now includes a long-document optimization mode for faster checks on large files.
 
@@ -47,6 +51,7 @@ It now includes a long-document optimization mode for faster checks on large fil
 ### 2) How KlarityCheck Works
 
 #### Input and Mode Resolution
+
 KlarityCheck resolves behavior from the optional query field:
 
 - `Topic/DOI` query: fetches academic references plus web references.
@@ -54,6 +59,7 @@ KlarityCheck resolves behavior from the optional query field:
 - Blank query with source text present: runs paragraph-based web search.
 
 #### Reference Fetch Pipeline
+
 Web provider sequence is ordered and explicit:
 
 1. DuckDuckGo Lite
@@ -64,6 +70,7 @@ Web provider sequence is ordered and explicit:
 If a provider returns low-overlap references, the pipeline continues to the next provider before committing results.
 
 #### Source Expansion
+
 For top web references, the app expands beyond snippets:
 
 - Fetches readable full-page content.
@@ -74,6 +81,7 @@ For top web references, the app expands beyond snippets:
 Only up to 3 deduplicated web references are retained in the final blend to keep quality high and noise low.
 
 #### Scoring Engine (Hybrid Similarity)
+
 The engine in `plag_algo.py` blends lexical and contextual signals:
 
 - Token cosine similarity
@@ -97,6 +105,7 @@ UI output includes:
 - Suggestions for reducing plagiarism risk
 
 #### Long-Document Strategy in KlarityCheck
+
 For very long text input, KlarityCheck builds an analysis payload from distributed regions (beginning, middle, end) instead of naively processing only the first section. This improves topic coverage and response speed.
 
 ---
@@ -106,9 +115,11 @@ For very long text input, KlarityCheck builds an analysis payload from distribut
 EduReplica performs direct local-text comparison using the same similarity core, but without web fetching.
 
 #### Standard Mode
+
 For normal-sized files, it compares extracted full text from both files.
 
 #### Long-Document Mode
+
 When either file is large, EduReplica switches to chunk mode:
 
 - Splits each file into overlapping word chunks.
@@ -122,13 +133,13 @@ The result panel reports chunk usage so users know when optimized mode was used.
 
 ### 4) File and Module Layout
 
-| File | Responsibility |
-| --- | --- |
-| `Plagiarism_Checker.py` | Tkinter UI, page routing, loading states, user actions, reporting |
-| `plag_algo.py` | File extraction, reference retrieval, web expansion, similarity scoring |
-| `.env.example` | Environment variable template |
-| `requirements.txt` | Python dependencies |
-| `docs/images/` | Replaceable documentation image placeholders |
+| File                    | Responsibility                                                          |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `Plagiarism_Checker.py` | Tkinter UI, page routing, loading states, user actions, reporting       |
+| `plag_algo.py`          | File extraction, reference retrieval, web expansion, similarity scoring |
+| `.env.example`          | Environment variable template                                           |
+| `requirements.txt`      | Python dependencies                                                     |
+| `docs/images/`          | Replaceable documentation image placeholders                            |
 
 ---
 
@@ -174,6 +185,12 @@ Copy `.env.example` to `.env` and fill values as needed.
 
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
+TOGETHER_API_KEY=your_together_api_key_here
+OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct:free
+GROQ_MODEL=llama-3.1-8b-instant
+TOGETHER_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo
 SERPAPI_API_KEY=your_serpapi_api_key_here
 SERPAPI_ENGINE=google
 SERPAPI_HL=en
@@ -183,6 +200,8 @@ SERPAPI_GL=us
 What each key does:
 
 - `OPENAI_API_KEY`: Enables AI rewrite/suggestion features in AuthentiText and top-card suggestions.
+- `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`: Alternative rewrite providers used as fallback when OpenAI is missing or unavailable.
+- `OPENROUTER_MODEL`, `GROQ_MODEL`, `TOGETHER_MODEL`: Optional model overrides for rewrite providers.
 - `SERPAPI_API_KEY`: Enables SerpApi fallback when first-hand web providers are weak or unavailable.
 - `SERPAPI_ENGINE`, `SERPAPI_HL`, `SERPAPI_GL`: Optional regional/language tuning for SerpApi.
 
@@ -205,14 +224,12 @@ python Plagiarism_Checker.py
 
 - `No references found`: verify internet connection and query specificity.
 - `SerpApi fallback is disabled`: add `SERPAPI_API_KEY` to `.env`.
-- `Rewrite assistant is unavailable`: install `openai` and provide `OPENAI_API_KEY`.
+- `Rewrite assistant is unavailable`: add at least one provider key (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, or `TOGETHER_API_KEY`). If no key is available, AuthentiText uses local rewrite fallback.
 - Very low overlap on scanned PDFs: ensure the PDF has selectable text or run OCR before import.
 
 ---
 
 ## Architecture Design
-
-### Mermaid View
 
 ```mermaid
 flowchart LR
@@ -239,8 +256,6 @@ flowchart LR
 
 	O[AuthentiText Rewrite] --> P[OpenAI Rewrite or Fallback]
 ```
-
-### Text View
 
 1. UI receives text, optional query, and/or uploaded files.
 2. Mode resolution decides whether the run is topic-based, URL-only, or blank-query web search.

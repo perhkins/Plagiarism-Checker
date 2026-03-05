@@ -3,6 +3,7 @@ import re
 import webbrowser
 from collections import Counter, defaultdict
 from pathlib import Path
+import requests
 from tkinter import (
     BOTH,
     END,
@@ -56,6 +57,9 @@ from plag_algo import (
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "").strip()
 client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
 
@@ -385,38 +389,203 @@ def suggest_improvement(text):
         return fallback
 
 
+def _extract_chat_response_text(payload):
+    choices = payload.get("choices") if isinstance(payload, dict) else []
+    if not choices:
+        return ""
+
+    message = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else {}
+    content = message.get("content", "") if isinstance(message, dict) else ""
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text_part = (item.get("text") or "").strip()
+                if text_part:
+                    parts.append(text_part)
+            elif isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    parts.append(stripped)
+        content = "\n".join(parts)
+
+    return str(content or "").strip()
+
+
+def _rewrite_with_provider_http(
+    provider_name,
+    endpoint,
+    api_key,
+    model,
+    system_prompt,
+    user_prompt,
+    extra_headers=None,
+    timeout=35,
+):
+    if not api_key:
+        return "", f"{provider_name}: missing key"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    payload = {
+        "model": model,
+        "temperature": 0.35,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        return "", f"{provider_name}: {exc.__class__.__name__}"
+
+    rewritten = _extract_chat_response_text(data)
+    if rewritten:
+        return rewritten, ""
+
+    return "", f"{provider_name}: empty response"
+
+
+def _local_tone_rewrite(text, tone):
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return ""
+
+    phrase_swaps = [
+        (r"\bin order to\b", "to"),
+        (r"\bdue to the fact that\b", "because"),
+        (r"\bin the event that\b", "if"),
+        (r"\ba large number of\b", "many"),
+        (r"\bhas the ability to\b", "can"),
+        (r"\bit is important to note that\b", "notably,"),
+        (r"\butilize\b", "use"),
+        (r"\bdemonstrate\b", "show"),
+        (r"\bfurthermore\b", "in addition"),
+        (r"\btherefore\b", "as a result"),
+    ]
+
+    sentences = [
+        segment.strip()
+        for segment in re.split(r"(?<=[.!?])\s+", cleaned)
+        if segment.strip()
+    ]
+    if not sentences:
+        sentences = [cleaned]
+
+    rewritten_sentences = []
+    for sentence in sentences:
+        updated = sentence
+        for pattern, replacement in phrase_swaps:
+            updated = re.sub(pattern, replacement, updated, flags=re.IGNORECASE)
+        rewritten_sentences.append(updated)
+
+    tone_prefixes = {
+        "professional": "From a professional standpoint",
+        "creative": "Seen through a more imaginative lens",
+        "formal": "From a formal perspective",
+        "casual": "Put simply",
+    }
+    prefix = tone_prefixes.get((tone or "").strip().lower(), "In clearer terms")
+
+    first_sentence = rewritten_sentences[0].strip()
+    if first_sentence:
+        lowered = first_sentence[0].lower() + first_sentence[1:] if len(first_sentence) > 1 else first_sentence.lower()
+        rewritten_sentences[0] = f"{prefix}, {lowered}"
+
+    return " ".join(rewritten_sentences).strip()
+
+
 def rewrite_with_tone(text, tone):
     cleaned = (text or "").strip()
     if not cleaned:
         return "Kindly enter text to rewrite."
 
-    if not client:
-        return (
-            "Rewrite assistant is unavailable. Add OPENAI_API_KEY to your .env file and restart "
-            "the app to enable AI rewrite."
-        )
+    selected_tone = (tone or "professional").strip()
+    system_prompt = (
+        "You are a professional rewriter. Keep factual meaning, improve originality, "
+        "and rewrite clearly in the requested tone."
+    )
+    user_prompt = f"Rewrite this text in a {selected_tone} tone:\n\n{cleaned}"
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional rewriter. Keep factual meaning, improve originality, "
-                        "and rewrite clearly in the requested tone."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Rewrite this text in a {tone} tone:\n\n{cleaned}",
-                },
-            ],
+    provider_errors = []
+
+    if client:
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            rewritten = (response.choices[0].message.content or "").strip()
+            if rewritten:
+                return rewritten
+        except Exception as exc:
+            provider_errors.append(f"OpenAI: {exc.__class__.__name__}")
+
+    provider_chain = [
+        (
+            "OpenRouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+            OPENROUTER_API_KEY,
+            os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free").strip() or "meta-llama/llama-3.1-8b-instruct:free",
+            {
+                "HTTP-Referer": "https://papercritic.local",
+                "X-Title": "PaperCritic",
+            },
+        ),
+        (
+            "Groq",
+            "https://api.groq.com/openai/v1/chat/completions",
+            GROQ_API_KEY,
+            os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant",
+            None,
+        ),
+        (
+            "Together",
+            "https://api.together.xyz/v1/chat/completions",
+            TOGETHER_API_KEY,
+            os.getenv("TOGETHER_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").strip() or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+            None,
+        ),
+    ]
+
+    for name, endpoint, api_key, model, headers in provider_chain:
+        if not api_key:
+            continue
+        rewritten, error_message = _rewrite_with_provider_http(
+            provider_name=name,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            extra_headers=headers,
         )
-        rewritten = (response.choices[0].message.content or "").strip()
-        return rewritten or "No rewritten output generated."
-    except Exception as exc:
-        return f"Rewrite failed: {exc}"
+        if rewritten:
+            return rewritten
+        if error_message:
+            provider_errors.append(error_message)
+
+    local_rewrite = _local_tone_rewrite(cleaned, selected_tone)
+    if local_rewrite:
+        return local_rewrite
+
+    if provider_errors:
+        return "Rewrite failed across configured providers. " + "; ".join(provider_errors[:3])
+
+    return cleaned
 
 
 def file_upload():
@@ -1944,13 +2113,27 @@ cart_button.pack(anchor="w", padx=30, pady=(0, 12))
 
 research_result_frame = Frame(research_page, bg=BG_SURFACE)
 
-if not OPENAI_API_KEY:
+rewrite_providers = []
+if OPENAI_API_KEY:
+    rewrite_providers.append("OpenAI")
+if OPENROUTER_API_KEY:
+    rewrite_providers.append("OpenRouter")
+if GROQ_API_KEY:
+    rewrite_providers.append("Groq")
+if TOGETHER_API_KEY:
+    rewrite_providers.append("Together")
+
+if rewrite_providers:
     set_feedback(
-        "OPENAI_API_KEY not found in .env. Rewriting and suggestions will use fallback text.",
-        WARNING,
+        "Rewrite providers enabled: " + ", ".join(rewrite_providers) + ".",
+        SUCCESS,
     )
 else:
-    set_feedback("OpenAI features are enabled.", SUCCESS)
+    set_feedback(
+        "No external AI key found. AuthentiText will use local rewrite fallback. "
+        "Add OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, or TOGETHER_API_KEY in .env for AI rewrite.",
+        WARNING,
+    )
 
 update_reference_status(
     "Ready. Use topic/DOI/URL or leave query blank for web search mode.",
