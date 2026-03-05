@@ -1,11 +1,11 @@
+import os
 import re
 import math
-import json
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from html import unescape
-from typing import Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import quote_plus
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 from PyPDF2 import PdfReader
@@ -299,6 +299,228 @@ def extract_query_keywords(text: str, top_k: int = 8) -> str:
   return " ".join(ordered)
 
 
+def _emit_progress(
+  progress_callback: Optional[Callable[[str], None]],
+  message: str,
+) -> None:
+  if not progress_callback:
+    return
+
+  try:
+    progress_callback(message)
+  except Exception:
+    # Progress updates should never interrupt core processing.
+    pass
+
+
+def _build_paragraph_search_queries(
+  query: str,
+  source_text: str = "",
+  max_queries: int = 4,
+  allow_fallback: bool = True,
+) -> List[str]:
+  """Build paragraph-level search queries from user text and optional explicit query."""
+  cleaned_query = _collapse_whitespace(query)
+  paragraph_candidates: List[Tuple[int, int, int, int, int, str]] = []
+
+  # For long documents, bias focus terms toward the opening section/topic statement.
+  if cleaned_query:
+    focus_seed = cleaned_query
+  else:
+    leading_tokens = _tokenize(source_text)[:220]
+    focus_seed = " ".join(leading_tokens)
+
+  focus_terms = set(extract_query_keywords(focus_seed, top_k=12).split())
+  if cleaned_query:
+    focus_terms.update(
+      token for token in _tokenize(cleaned_query) if len(token) >= 4 and token not in STOPWORDS
+    )
+
+  if source_text:
+    for index, match in enumerate(PARAGRAPH_RE.finditer(source_text)):
+      raw_block = match.group()
+      raw_paragraph = _collapse_whitespace(raw_block)
+      if not raw_paragraph:
+        continue
+
+      tokens = _tokenize(raw_paragraph)
+      if len(tokens) < 14:
+        continue
+
+      content_tokens = [
+        token for token in tokens if token not in STOPWORDS and len(token) >= 4
+      ]
+      content_diversity = len(set(content_tokens))
+      if content_diversity < 6:
+        continue
+
+      focus_overlap = len(set(content_tokens) & focus_terms) if focus_terms else 0
+      list_penalty = raw_block.count(";") + max(0, raw_block.count("\n") - 1)
+      position_bias = 1 if index < 4 else 0
+
+      query_tokens = tokens[:26]
+      query_text = " ".join(query_tokens)
+      paragraph_candidates.append(
+        (
+          focus_overlap + position_bias,
+          list_penalty,
+          content_diversity,
+          len(query_tokens),
+          index,
+          query_text,
+        )
+      )
+
+  selected_queries: List[str] = []
+  seen = set()
+  for _focus, _list_penalty, _diversity, _token_count, _index, candidate in sorted(
+    paragraph_candidates,
+    key=lambda value: (-value[0], value[1], -value[2], -value[3], value[4]),
+  ):
+    normalized_candidate = _normalize_text(candidate)
+    if not normalized_candidate or normalized_candidate in seen:
+      continue
+
+    seen.add(normalized_candidate)
+    selected_queries.append(candidate)
+    if len(selected_queries) >= max_queries:
+      break
+
+  if selected_queries:
+    return selected_queries
+
+  if not allow_fallback:
+    return []
+
+  fallback_queries: List[str] = []
+  if cleaned_query:
+    fallback_queries.append(" ".join(cleaned_query.split()[:20]))
+
+  if source_text:
+    fallback_keyword_query = extract_query_keywords(source_text, top_k=12)
+    if fallback_keyword_query and _normalize_text(fallback_keyword_query) not in {
+      _normalize_text(value) for value in fallback_queries
+    }:
+      fallback_queries.append(fallback_keyword_query)
+
+  if fallback_queries:
+    return fallback_queries[: max(1, min(2, max_queries))]
+
+  return [cleaned_query] if cleaned_query else []
+
+
+def _deduplicate_reference_items(
+  references: Sequence[Dict[str, str]],
+  max_results: int = 0,
+) -> List[Dict[str, str]]:
+  deduplicated: List[Dict[str, str]] = []
+  seen = set()
+
+  for reference in references:
+    url_key = _collapse_whitespace(reference.get("url", "")).lower()
+    title_key = _collapse_whitespace(reference.get("title", "")).lower()
+    text_key = _normalize_text((reference.get("text", "") or "")[:240])
+    key = url_key or f"{title_key}|{text_key}"
+    if not key or key in seen:
+      continue
+
+    seen.add(key)
+    deduplicated.append(reference)
+    if max_results > 0 and len(deduplicated) >= max_results:
+      break
+
+  return deduplicated
+
+
+def _fetch_firsthand_web_sources(
+  queries: Sequence[str],
+  timeout: int,
+  max_results: int,
+  progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Dict[str, str]], List[str], str]:
+  issues: List[str] = []
+  providers: Sequence[Tuple[str, Callable[..., List[Dict[str, str]]]]] = (
+    ("DuckDuckGo", fetch_duckduckgo_results),
+    ("Grokipedia", fetch_grokipedia_results),
+    ("Wikipedia", fetch_wikipedia_results),
+  )
+
+  for source_name, provider in providers:
+    _emit_progress(progress_callback, f"Collecting web sources: {source_name}")
+    source_results: List[Dict[str, str]] = []
+
+    for query in queries:
+      try:
+        fetched = provider(
+          query,
+          max_results=max_results,
+          timeout=min(timeout, 7),
+        )
+      except Exception as exc:
+        issues.append(f"{source_name} unavailable ({exc.__class__.__name__})")
+        continue
+
+      if not fetched:
+        continue
+
+      source_results.extend(fetched)
+      source_results = _deduplicate_reference_items(source_results, max_results=max_results)
+      if len(source_results) >= max_results:
+        break
+
+    source_results = _deduplicate_reference_items(source_results, max_results=max_results)
+    if source_results:
+      return source_results, issues, source_name
+
+  return [], issues, ""
+
+
+def _fetch_web_sources_for_queries(
+  queries: Sequence[str],
+  timeout: int,
+  serpapi_api_key: str,
+  max_results: int = 3,
+  progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Dict[str, str]], List[str], str]:
+  if not queries:
+    return [], ["No paragraph query available for web search."], ""
+
+  first_hand_results, issues, first_hand_source = _fetch_firsthand_web_sources(
+    queries=queries,
+    timeout=timeout,
+    max_results=max_results,
+    progress_callback=progress_callback,
+  )
+  if first_hand_results:
+    return first_hand_results, issues, first_hand_source
+
+  if not serpapi_api_key:
+    issues.append("SerpApi unavailable (missing SERPAPI_API_KEY)")
+    return [], issues, ""
+
+  _emit_progress(progress_callback, "Collecting web sources: SerpApi fallback")
+  serpapi_results: List[Dict[str, str]] = []
+  for query in queries:
+    fetched = fetch_serpapi_results(
+      query,
+      api_key=serpapi_api_key,
+      max_results=max_results,
+      timeout=min(timeout, 7),
+    )
+    if not fetched:
+      continue
+
+    serpapi_results.extend(fetched)
+    serpapi_results = _deduplicate_reference_items(serpapi_results, max_results=max_results)
+    if len(serpapi_results) >= max_results:
+      break
+
+  if serpapi_results:
+    return serpapi_results, issues, "SerpApi"
+
+  return [], issues, ""
+
+
 def _make_ngrams(tokens: Sequence[str], n: int = 3) -> set:
   if not tokens:
     return set()
@@ -366,11 +588,11 @@ def _openalex_abstract_from_index(inverted_index: Dict[str, List[int]]) -> str:
 
 
 def fetch_duckduckgo_results(query: str, max_results: int = 10, timeout: int = 6) -> List[Dict[str, str]]:
-  """Fetch web search results from DuckDuckGo HTML (free, no API key)."""
+  """Fetch web search results from DuckDuckGo Lite (free, no API key)."""
   results = []
   try:
     encoded_query = quote_plus(query)
-    url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+    url = f"https://lite.duckduckgo.com/lite/?q={encoded_query}"
     response = requests.get(
       url,
       timeout=timeout,
@@ -379,22 +601,36 @@ def fetch_duckduckgo_results(query: str, max_results: int = 10, timeout: int = 6
     response.raise_for_status()
     
     html = response.text
-    # Extract search result links and snippets
-    link_pattern = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>')
-    snippet_pattern = re.compile(r'<a[^>]+class="result__snippet"[^>]*>([^<]+)</a>')
+    # DuckDuckGo Lite uses single quotes for class attributes on many pages.
+    link_pattern = re.compile(
+      r"<a(?=[^>]*class=['\"][^'\"]*result-link[^'\"]*['\"])(?=[^>]*href=['\"]([^'\"]+)['\"])[^>]*>(.*?)</a>",
+      flags=re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(
+      r"<td[^>]+class=['\"][^'\"]*result-snippet[^'\"]*['\"][^>]*>(.*?)</td>",
+      flags=re.IGNORECASE | re.DOTALL,
+    )
     
     links = link_pattern.findall(html)
     snippets = snippet_pattern.findall(html)
     
-    for i, (link, title) in enumerate(links[:max_results]):
+    for i, (link, title_html) in enumerate(links[:max_results]):
       snippet = snippets[i] if i < len(snippets) else ""
       snippet_text = _strip_html_text(snippet)
+      title = _strip_html_text(title_html)
+
+      if link.startswith("//duckduckgo.com/l/?") or link.startswith("/l/?"):
+        parsed_url = f"https:{link}" if link.startswith("//") else f"https://duckduckgo.com{link}"
+        parsed = parse_qs(urlparse(parsed_url).query)
+        target = parsed.get("uddg", [""])[0]
+        if target:
+          link = unquote(target)
       
-      if len(snippet_text) < 50:
+      if len(snippet_text) < 30:
         continue
         
       results.append({
-        "title": _strip_html_text(title)[:200],
+        "title": title[:200],
         "url": link,
         "text": snippet_text[:1500],
         "source": "DuckDuckGo",
@@ -422,7 +658,6 @@ def fetch_wikipedia_results(query: str, max_results: int = 5, timeout: int = 6) 
     search_data = search_response.json()
     
     titles = search_data[1] if len(search_data) > 1 else []
-    descriptions = search_data[2] if len(search_data) > 2 else []
     urls = search_data[3] if len(search_data) > 3 else []
     
     # Fetch extracts for each article
@@ -456,39 +691,149 @@ def fetch_wikipedia_results(query: str, max_results: int = 5, timeout: int = 6) 
   return results
 
 
-def fetch_google_custom_search(query: str, api_key: str = "", cx: str = "", max_results: int = 10, timeout: int = 6) -> List[Dict[str, str]]:
-  """Fetch web results from Google Custom Search API (100 free queries/day with API key)."""
-  results = []
-  if not api_key or not cx:
-    return results
-    
+def fetch_grokipedia_results(query: str, max_results: int = 5, timeout: int = 6) -> List[Dict[str, str]]:
+  """Fetch results from Grokipedia, trying API first then HTML search fallback."""
+  results: List[Dict[str, str]] = []
+  headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  }
+
   try:
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-      "key": api_key,
-      "cx": cx,
-      "q": query,
-      "num": min(10, max_results),
-    }
-    response = requests.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    
-    for item in data.get("items", [])[:max_results]:
-      title = item.get("title", "")
-      link = item.get("link", "")
-      snippet = item.get("snippet", "")
-      
-      if len(snippet) >= 50:
-        results.append({
-          "title": title[:200],
-          "url": link,
-          "text": snippet[:1500],
-          "source": "Google",
-        })
+    api_response = requests.get(
+      "https://grokipedia.com/api/search",
+      params={"q": query, "limit": max_results},
+      timeout=timeout,
+      headers=headers,
+    )
+    if api_response.ok:
+      payload = api_response.json()
+      if isinstance(payload, dict):
+        items = payload.get("results") or payload.get("items") or []
+      elif isinstance(payload, list):
+        items = payload
+      else:
+        items = []
+
+      for item in items[:max_results]:
+        if not isinstance(item, dict):
+          continue
+
+        title = _collapse_whitespace(item.get("title", ""))
+        link = _collapse_whitespace(item.get("url", "") or item.get("link", ""))
+        snippet = _collapse_whitespace(
+          item.get("snippet", "")
+          or item.get("summary", "")
+          or item.get("description", "")
+        )
+        if not link or len(snippet) < 45:
+          continue
+
+        results.append(
+          {
+            "title": title[:200] if title else "Untitled",
+            "url": link,
+            "text": snippet[:1800],
+            "source": "Grokipedia",
+          }
+        )
+
+      results = _deduplicate_reference_items(results, max_results=max_results)
+      if results:
+        return results
   except Exception:
     pass
-  
+
+  try:
+    page_response = requests.get(
+      "https://grokipedia.com/search",
+      params={"q": query},
+      timeout=timeout,
+      headers=headers,
+    )
+    page_response.raise_for_status()
+    html = page_response.text
+
+    link_pattern = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    snippet_pattern = re.compile(r'<p[^>]*>(.*?)</p>', re.IGNORECASE | re.DOTALL)
+    snippets = [_strip_html_text(value) for value in snippet_pattern.findall(html)]
+
+    for index, (link, title_html) in enumerate(link_pattern.findall(html)):
+      title = _strip_html_text(title_html)
+      if len(title) < 6:
+        continue
+
+      if link.startswith("/"):
+        link = f"https://grokipedia.com{link}"
+      if not link.startswith("http"):
+        continue
+
+      snippet = snippets[index] if index < len(snippets) else ""
+      if len(snippet) < 60:
+        continue
+
+      results.append(
+        {
+          "title": title[:200],
+          "url": link,
+          "text": snippet[:1800],
+          "source": "Grokipedia",
+        }
+      )
+      if len(results) >= max_results:
+        break
+  except Exception:
+    pass
+
+  return _deduplicate_reference_items(results, max_results=max_results)
+
+
+def fetch_serpapi_results(query: str, api_key: str = "", max_results: int = 10, timeout: int = 6) -> List[Dict[str, str]]:
+  """Fetch web results from SerpApi as a second-hand fallback."""
+  results = []
+  if not api_key:
+    return results
+
+  try:
+    language = os.getenv("SERPAPI_HL", "en").strip() or "en"
+    region = os.getenv("SERPAPI_GL", "us").strip() or "us"
+    engine = os.getenv("SERPAPI_ENGINE", "google").strip() or "google"
+
+    response = requests.get(
+      "https://serpapi.com/search.json",
+      params={
+        "engine": engine,
+        "q": query,
+        "api_key": api_key,
+        "num": min(10, max(1, max_results)),
+        "hl": language,
+        "gl": region,
+      },
+      timeout=timeout,
+      headers={"User-Agent": "AuthentiText/1.0"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    for item in payload.get("organic_results", []):
+      title = _collapse_whitespace(item.get("title", ""))
+      link = _collapse_whitespace(item.get("link", ""))
+      snippet = _collapse_whitespace(item.get("snippet", ""))
+      if not link or len(snippet) < 45:
+        continue
+
+      results.append(
+        {
+          "title": title[:200] if title else "Untitled",
+          "url": link,
+          "text": snippet[:1800],
+          "source": "SerpApi",
+        }
+      )
+      if len(results) >= max_results:
+        break
+  except Exception:
+    pass
+
   return results
 
 
@@ -532,27 +877,185 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
   )
 
 
+def _fetch_readable_text_from_url(
+  url: str,
+  timeout: int = 8,
+  max_chars: int = 22000,
+) -> Tuple[str, str]:
+  """Fetch and clean readable text from a result URL for deeper similarity checks."""
+  cleaned_url = _collapse_whitespace(url)
+  if not cleaned_url or not cleaned_url.lower().startswith(("http://", "https://")):
+    return "", ""
+
+  try:
+    response = requests.get(
+      cleaned_url,
+      timeout=timeout,
+      headers={
+        "User-Agent": "AuthentiText/1.0",
+        "Accept": "text/html,application/xhtml+xml",
+      },
+    )
+    response.raise_for_status()
+  except requests.RequestException:
+    return "", ""
+
+  html_text = response.text or ""
+  if len(html_text) < 200:
+    return "", ""
+
+  title_match = re.search(
+    r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL
+  )
+  title = _strip_html_text(title_match.group(1)) if title_match else ""
+
+  html_text = re.sub(
+    r"<(script|style|noscript|svg)[^>]*>.*?</\1>",
+    " ",
+    html_text,
+    flags=re.IGNORECASE | re.DOTALL,
+  )
+  text_content = _strip_html_text(html_text)
+  if len(text_content) < 260:
+    return title, ""
+
+  return title, text_content[:max_chars]
+
+
+def _expand_web_references_with_page_text(
+  references: Sequence[Dict[str, str]],
+  timeout: int,
+  progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Dict[str, str]], int]:
+  """Replace short snippets with fetched page text for top web references."""
+  expanded_references: List[Dict[str, str]] = []
+  expanded_count = 0
+  total = len(references)
+
+  for index, reference in enumerate(references, start=1):
+    current = dict(reference)
+    source_name = _collapse_whitespace(current.get("source", ""))
+    url = _collapse_whitespace(current.get("url", ""))
+
+    if source_name in {"DuckDuckGo", "Grokipedia", "SerpApi", "Wikipedia"} and url:
+      _emit_progress(progress_callback, f"Expanding web pages ({index}/{total})")
+      page_title, page_text = _fetch_readable_text_from_url(
+        url,
+        timeout=min(timeout, 8),
+      )
+      if len(page_text) >= 260:
+        current["text"] = page_text
+        if page_title and len(page_title) >= 4:
+          current["title"] = page_title[:200]
+        expanded_count += 1
+
+    expanded_references.append(current)
+
+  return expanded_references, expanded_count
+
+
+def fetch_web_reference_texts(
+  source_text: str,
+  query: str = "",
+  max_results: int = 3,
+  timeout: int = 8,
+  progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[Dict[str, str]], str]:
+  """Fetch references from web-only sources using paragraph-driven queries."""
+  cleaned_query = _collapse_whitespace(query)
+  cleaned_source_text = (source_text or "").strip()
+  if not cleaned_query and not cleaned_source_text:
+    return [], "Enter or upload text first to run paragraph-based web search."
+
+  _emit_progress(progress_callback, "Preparing paragraph web queries")
+  web_queries = _build_paragraph_search_queries(
+    cleaned_query,
+    source_text=cleaned_source_text,
+    max_queries=4,
+    allow_fallback=True,
+  )
+  if not web_queries:
+    return [], "Unable to build paragraph search queries from the provided text."
+
+  serpapi_api_key = (
+    os.getenv("SERPAPI_API_KEY", "").strip()
+    or os.getenv("SERPAPI_KEY", "").strip()
+  )
+  web_results, issues, source_name = _fetch_web_sources_for_queries(
+    queries=web_queries,
+    timeout=timeout,
+    serpapi_api_key=serpapi_api_key,
+    max_results=max(1, min(3, max_results)),
+    progress_callback=progress_callback,
+  )
+  web_results = _deduplicate_reference_items(
+    web_results,
+    max_results=max(1, min(3, max_results)),
+  )
+
+  if web_results:
+    web_results, expanded_pages = _expand_web_references_with_page_text(
+      web_results,
+      timeout=timeout,
+      progress_callback=progress_callback,
+    )
+  else:
+    expanded_pages = 0
+
+  if web_results:
+    source_used = source_name or "web search"
+    message = (
+      f"Loaded {len(web_results)} web references from {source_used}. "
+      "Search order: DuckDuckGo -> Grokipedia -> Wikipedia -> SerpApi fallback."
+    )
+    if expanded_pages > 0:
+      message += f" Expanded {expanded_pages} web pages for deeper comparison."
+    if issues:
+      message += " Some providers were unavailable during lookup."
+    if not serpapi_api_key and source_used != "SerpApi":
+      message += " SerpApi fallback is disabled (missing SERPAPI_API_KEY)."
+    return web_results, message
+
+  if not serpapi_api_key:
+    issues.append("SerpApi unavailable (missing SERPAPI_API_KEY)")
+
+  if issues:
+    return [], "No web references found. " + "; ".join(sorted(set(issues)))
+
+  return [], "No web references found from DuckDuckGo, Grokipedia, Wikipedia, or SerpApi."
+
+
 def fetch_reference_texts(
   query: str,
   max_results: int = 20,
   timeout: int = 8,
+  source_text: str = "",
+  progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Dict[str, str]], str]:
-  """
-  Fetch references from multiple free sources: academic papers (Crossref, OpenAlex, Semantic Scholar)
-  and web content (DuckDuckGo, Wikipedia). Returns a list of references and a status message.
-  """
+  """Fetch references for topic/DOI mode: academic docs + web/SerpApi lookups."""
   cleaned_query = _collapse_whitespace(query)
   if not cleaned_query:
     return [], "Enter a topic, DOI, title, or URL first."
 
+  _emit_progress(progress_callback, "Preparing paragraph web queries")
+  web_queries = _build_paragraph_search_queries(
+    cleaned_query,
+    source_text=source_text,
+    max_queries=4,
+    allow_fallback=True,
+  )
+  primary_query = cleaned_query
+
   references: List[Dict[str, str]] = []
   issues: List[str] = []
+  hints: List[str] = []
 
+  _emit_progress(progress_callback, "Collecting sources: Crossref")
   try:
-    crossref_rows = min(80, max(20, max_results * 4))
+    crossref_rows = min(48, max(16, max_results * 2))
     crossref_response = requests.get(
       "https://api.crossref.org/works",
-      params={"query.bibliographic": cleaned_query, "rows": crossref_rows},
+      params={"query.bibliographic": primary_query, "rows": crossref_rows},
       timeout=timeout,
       headers={
         "User-Agent": "AuthentiText/1.0 (mailto:example@example.com)",
@@ -583,15 +1086,16 @@ def fetch_reference_texts(
 
   # OpenAlex has broader free abstract coverage and works well as fallback.
   if len(references) < max_results:
+    _emit_progress(progress_callback, "Collecting sources: OpenAlex")
     try:
-      per_page = min(50, max(20, max_results))
-      for page in range(1, 4):
+      per_page = min(32, max(14, max_results))
+      for page in range(1, 3):
         if len(references) >= max_results * 2:
           break
 
         openalex_response = requests.get(
           "https://api.openalex.org/works",
-          params={"search": cleaned_query, "per-page": per_page, "page": page},
+          params={"search": primary_query, "per-page": per_page, "page": page},
           timeout=timeout,
         )
         openalex_response.raise_for_status()
@@ -620,12 +1124,13 @@ def fetch_reference_texts(
 
   # Semantic Scholar often returns abstracts for broad topics and has free unauthenticated access.
   if len(references) < max_results:
+    _emit_progress(progress_callback, "Collecting sources: Semantic Scholar")
     try:
-      ss_limit = min(50, max(20, max_results * 2))
+      ss_limit = min(34, max(14, max_results + 8))
       ss_response = requests.get(
         "https://api.semanticscholar.org/graph/v1/paper/search",
         params={
-          "query": cleaned_query,
+          "query": primary_query,
           "limit": ss_limit,
           "fields": "title,abstract,url,externalIds",
         },
@@ -658,50 +1163,85 @@ def fetch_reference_texts(
     except requests.RequestException as exc:
       issues.append(f"Semantic Scholar unavailable ({exc.__class__.__name__})")
 
-  # Add web sources (DuckDuckGo and Wikipedia) for broader coverage beyond academic papers
-  if len(references) < max_results:
-    try:
-      web_results = fetch_duckduckgo_results(cleaned_query, max_results=8, timeout=timeout)
-      references.extend(web_results)
-    except Exception as exc:
-      issues.append(f"DuckDuckGo search failed ({exc.__class__.__name__})")
+  _emit_progress(progress_callback, "Collecting sources: Web")
+  serpapi_api_key = (
+    os.getenv("SERPAPI_API_KEY", "").strip()
+    or os.getenv("SERPAPI_KEY", "").strip()
+  )
 
-  if len(references) < max_results:
-    try:
-      wiki_results = fetch_wikipedia_results(cleaned_query, max_results=5, timeout=timeout)
-      references.extend(wiki_results)
-    except Exception as exc:
-      issues.append(f"Wikipedia search failed ({exc.__class__.__name__})")
+  web_results, web_issues, web_source_name = _fetch_web_sources_for_queries(
+    queries=web_queries,
+    timeout=timeout,
+    serpapi_api_key=serpapi_api_key,
+    max_results=3,
+    progress_callback=progress_callback,
+  )
+  web_results = _deduplicate_reference_items(web_results, max_results=3)
 
-  deduplicated: List[Dict[str, str]] = []
-  seen = set()
-  for reference in references:
-    key = (
-      reference["title"].lower(),
-      reference["text"][:240].lower(),
+  if web_results:
+    web_results, expanded_pages = _expand_web_references_with_page_text(
+      web_results,
+      timeout=timeout,
+      progress_callback=progress_callback,
     )
-    if key in seen:
-      continue
-    seen.add(key)
-    deduplicated.append(reference)
+  else:
+    expanded_pages = 0
 
-  deduplicated = deduplicated[:max_results]
+  references.extend(web_results)
+  issues.extend(web_issues)
 
-  if deduplicated:
-    message = f"Loaded {len(deduplicated)} references from academic and web sources."
+  if not serpapi_api_key:
+    hints.append(
+      "SerpApi fallback disabled. Set SERPAPI_API_KEY in .env to enable it."
+    )
+
+  _emit_progress(progress_callback, "Cleaning up collected sources")
+  deduplicated = _deduplicate_reference_items(references)
+
+  # Keep web references compact in the listing while preserving academic docs.
+  web_sources = {"DuckDuckGo", "Grokipedia", "Wikipedia", "SerpApi"}
+  web_refs = [ref for ref in deduplicated if ref.get("source") in web_sources]
+  academic_refs = [ref for ref in deduplicated if ref.get("source") not in web_sources]
+  web_refs = web_refs[:3]
+
+  academic_limit = max(0, max_results - len(web_refs))
+  blended = academic_refs[:academic_limit] + web_refs
+  if len(blended) < max_results:
+    for ref in deduplicated:
+      if ref in blended:
+        continue
+      blended.append(ref)
+      if len(blended) >= max_results:
+        break
+
+  blended = blended[:max_results]
+
+  if blended:
+    query_note = f"Ran {len(web_queries)} paragraph-based web query variants."
+    if web_source_name:
+      query_note += f" First successful web provider: {web_source_name}."
+    message = f"Loaded {len(blended)} references from academic and web sources. {query_note}"
+    if web_refs:
+      message += f" Web references shown: {len(web_refs)} (max 3)."
+    if expanded_pages > 0:
+      message += f" Expanded {expanded_pages} web pages for deeper comparison."
     if issues:
       message += " Some sources were unavailable, but fallback succeeded."
-    return deduplicated, message
+    if hints:
+      message += " " + " ".join(hints)
+    return blended, message
 
   if issues:
+    base_message = " ".join(hints).strip()
     return (
       [],
       "Unable to load API references right now. "
       "Check your internet and try again, or use local files. "
-      + "; ".join(issues),
+      + "; ".join(issues)
+      + (f" {base_message}" if base_message else ""),
     )
 
-  return [], "No usable abstracts found. Try a more specific query or use local files."
+  return [], "No usable sources found. Try a more specific topic or URL, then fetch again."
 
 
 def _offline_self_overlap_result(
@@ -752,6 +1292,7 @@ def analyze_text_against_references(
   references: Sequence[Dict[str, str]],
   min_score: float = 0.66,
   max_matches: int = 12,
+  progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, object]:
   """
   Compare text to external references with hybrid scoring over words, sentences, and paragraphs.
@@ -766,6 +1307,7 @@ def analyze_text_against_references(
       "note": "No text provided.",
     }
 
+  _emit_progress(progress_callback, "Extracting text spans")
   target_sentences = _sentence_spans(cleaned_text, min_words=3)
   target_paragraphs = _paragraph_spans(cleaned_text, min_words=8)
   _assign_paragraph_ids(target_sentences, target_paragraphs)
@@ -785,15 +1327,24 @@ def analyze_text_against_references(
       note="No API references loaded. Result uses internal overlap only.",
     )
 
+  _emit_progress(progress_callback, "Building source index")
   reference_sentences: List[Dict[str, object]] = []
   reference_paragraphs: List[Dict[str, object]] = []
   ngram_index = defaultdict(set)
   concept_index = defaultdict(set)
+  total_references = len(references)
+  ref_progress_step = max(1, total_references // 5)
 
-  for reference in references:
+  for ref_number, reference in enumerate(references, start=1):
     title = _collapse_whitespace(reference.get("title", "Reference"))
     url = _collapse_whitespace(reference.get("url", ""))
     source_name = _collapse_whitespace(reference.get("source", "API"))
+
+    if ref_number == 1 or ref_number % ref_progress_step == 0 or ref_number == total_references:
+      _emit_progress(
+        progress_callback,
+        f"Indexing source passages ({ref_number}/{total_references})",
+      )
 
     reference_text = _repair_character_spaced_text(reference.get("text", ""))
     ref_paragraphs = _paragraph_spans(reference_text, min_words=8)
@@ -831,8 +1382,22 @@ def analyze_text_against_references(
       note="Loaded references had no extractable sentence content.",
     )
 
+  _emit_progress(progress_callback, "Checking against sources")
   all_matches: List[Dict[str, object]] = []
-  for sentence in target_sentences:
+  total_sentences = len(target_sentences)
+  sentence_progress_step = max(8, total_sentences // 10)
+
+  for sentence_index, sentence in enumerate(target_sentences, start=1):
+    if (
+      sentence_index == 1
+      or sentence_index % sentence_progress_step == 0
+      or sentence_index == total_sentences
+    ):
+      _emit_progress(
+        progress_callback,
+        f"Checking against sources ({sentence_index}/{total_sentences})",
+      )
+
     candidate_counter = Counter()
     for ngram in sentence["ngrams"]:
       for ref_idx in ngram_index.get(ngram, set()):
@@ -911,6 +1476,7 @@ def analyze_text_against_references(
   else:
     display_matches = all_matches[:max_matches]
 
+  _emit_progress(progress_callback, "Cleaning up results")
   # Coverage uses all detected matches, not only the displayed top-N list.
   coverage = [0] * len(cleaned_text)
   for match in all_matches:
@@ -944,11 +1510,23 @@ def check_against_reference_text(ref_file: str, text_file: str) -> float:
   ref_text = process_file(ref_file)
   text = process_file(text_file)
 
-  if not ref_text or not text:
+  return compare_texts(ref_text, text)
+
+
+def compare_texts(
+  reference_text: str,
+  text: str,
+  progress_callback: Optional[Callable[[str], None]] = None,
+) -> float:
+  """Compare already loaded text strings and return plagiarism percent."""
+  ref_text = _repair_character_spaced_text(reference_text or "").strip()
+  cleaned_text = _repair_character_spaced_text(text or "").strip()
+
+  if not ref_text or not cleaned_text:
     return 0.0
 
   result = analyze_text_against_references(
-    text=text,
+    text=cleaned_text,
     references=[
       {
         "title": "Reference File",
@@ -959,6 +1537,7 @@ def check_against_reference_text(ref_file: str, text_file: str) -> float:
     ],
     min_score=0.60,
     max_matches=0,
+    progress_callback=progress_callback,
   )
   return float(result.get("data", [0.0, 100.0])[0])
 

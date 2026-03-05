@@ -43,10 +43,10 @@ except ImportError:
 
 from plag_algo import (
     analyze_text_against_references,
-    check_against_reference_text as cart,
-    extract_query_keywords,
+    compare_texts,
     fetch_reference_from_url,
     fetch_reference_texts,
+    fetch_web_reference_texts,
     process_file,
 )
 
@@ -60,6 +60,9 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 full_text = ""
 rewritten_text = ""
 api_references = []
+reference_cache_mode = "none"
+reference_cache_query = ""
+reference_cache_source_key = ""
 plagiarized_data = {
     "plagiarized_contents": {},
     "data": [0.0, 100.0],
@@ -93,6 +96,7 @@ DETAILS_COLLAPSED_PREVIEW = 170
 loading_message = ""
 loading_phase = 0
 loading_after_id = None
+loading_frame = None
 
 
 def set_feedback(message, color=TEXT_MUTED):
@@ -108,21 +112,38 @@ def _animate_loading_label():
     loading_after_id = progress_label.after(280, _animate_loading_label)
 
 
-def start_loading(message):
+def set_loading_phase(message):
     global loading_message, loading_phase
 
     loading_message = message
     loading_phase = 0
-    progress_label.config(text=message)
-    progress_label.pack(padx=40)
+
+    if loading_frame is not None and not loading_frame.winfo_manager():
+        loading_frame.pack(after=header, fill=X, padx=30, pady=(6, 4))
+    if not progress_label.winfo_manager():
+        progress_label.pack(anchor="w")
+    if not progress_bar.winfo_manager():
+        progress_bar.pack(fill=X, pady=(4, 0))
+
+    progress_label.config(text=loading_message)
+    try:
+        root.update()
+    except Exception:
+        pass
+
+
+def start_loading(message):
+    global loading_after_id
+
+    set_loading_phase(message)
 
     progress_bar.config(mode="indeterminate")
-    progress_bar.pack(padx=40, pady=5)
     progress_bar.start(12)
-    _animate_loading_label()
+    if loading_after_id is None:
+        _animate_loading_label()
 
-    # Ensure the loading state is painted before blocking work starts.
-    root.update_idletasks()
+    # Ensure the loading state is visible before blocking work starts.
+    root.update()
 
 
 def stop_loading():
@@ -139,6 +160,13 @@ def stop_loading():
     progress_bar.config(mode="determinate", value=0)
     progress_label.pack_forget()
     progress_bar.pack_forget()
+    if loading_frame is not None:
+        loading_frame.pack_forget()
+
+    try:
+        root.update_idletasks()
+    except Exception:
+        pass
 
 
 def reset_review_output(clear_message=""):
@@ -344,49 +372,85 @@ def file_upload():
     return file_path
 
 
-def get_effective_reference_query(source_text):
+def build_source_cache_key(source_text):
+    normalized = " ".join((source_text or "").lower().split())
+    return normalized[:1200]
+
+
+def resolve_reference_mode(source_text):
     raw_query = reference_query_entry.get().strip()
     if raw_query:
-        return raw_query, ""
+        if raw_query.lower().startswith(("http://", "https://")):
+            return "url", raw_query, ""
+        return "topic", raw_query, ""
 
-    auto_query = extract_query_keywords(source_text, top_k=10)
-    if auto_query:
-        reference_query_entry.delete(0, END)
-        reference_query_entry.insert(END, auto_query)
-        return auto_query, f"No query entered. Auto-generated keywords: '{auto_query}'."
+    if source_text:
+        return (
+            "web",
+            "",
+            (
+                "No topic/DOI entered. Running paragraph web search "
+                "(DuckDuckGo -> Grokipedia -> Wikipedia -> SerpApi fallback)."
+            ),
+        )
 
-    return "", "Enter a topic/DOI/URL or add richer text for keyword extraction."
+    return "web", "", "Enter a topic, DOI, URL, or upload text before fetching references."
+
+
+def fetch_references_for_mode(mode, query, source_text):
+    if mode == "url":
+        set_loading_phase("Collecting sources: URL import")
+        reference, status = fetch_reference_from_url(query, timeout=8)
+        return ([reference] if reference else []), status
+
+    if mode == "topic":
+        set_loading_phase("Collecting sources: reference docs + web")
+        return fetch_reference_texts(
+            query,
+            max_results=REFERENCE_FETCH_LIMIT,
+            timeout=8,
+            source_text=source_text,
+            progress_callback=set_loading_phase,
+        )
+
+    set_loading_phase("Collecting sources: web + SerpApi")
+    return fetch_web_reference_texts(
+        source_text=source_text,
+        query=query,
+        max_results=3,
+        timeout=8,
+        progress_callback=set_loading_phase,
+    )
 
 
 def import_references():
-    global api_references
+    global api_references, reference_cache_mode, reference_cache_query
+    global reference_cache_source_key
 
     source_text = text_box.get("1.0", END).strip()
-    query, query_note = get_effective_reference_query(source_text)
-    if not query:
-        messagebox.showwarning("Missing Input", query_note)
+    mode, query, mode_note = resolve_reference_mode(source_text)
+    if mode == "web" and not source_text:
+        messagebox.showwarning("Missing Input", mode_note)
         return
 
-    start_loading("Searching multiple sources")
+    start_loading("Collecting sources")
 
     try:
-        if query.lower().startswith(("http://", "https://")):
-            reference, status = fetch_reference_from_url(query, timeout=8)
-            api_references = [reference] if reference else []
-        else:
-            # Update message to reflect comprehensive search
-            progress_label.config(text="Searching academic and web sources...")
-            root.update_idletasks()
-            api_references, status = fetch_reference_texts(
-                query,
-                max_results=REFERENCE_FETCH_LIMIT,
-                timeout=8,
-            )
+        api_references, status = fetch_references_for_mode(mode, query, source_text)
     finally:
         stop_loading()
 
-    if query_note and query_note not in status:
-        status = f"{query_note} {status}".strip()
+    if mode_note and mode_note not in status:
+        status = f"{mode_note} {status}".strip()
+
+    if api_references:
+        reference_cache_mode = mode
+        reference_cache_query = query.strip().lower() if mode in {"topic", "url"} else ""
+        reference_cache_source_key = build_source_cache_key(source_text) if mode == "web" else ""
+    else:
+        reference_cache_mode = "none"
+        reference_cache_query = ""
+        reference_cache_source_key = ""
 
     if api_references:
         set_feedback(status, SUCCESS)
@@ -413,7 +477,7 @@ def preview_loaded_references():
             "No References",
             (
                 "No references loaded yet.\n"
-                "Use a topic, DOI, title, or URL and click 'Fetch References'."
+                "Use a topic/DOI/URL, or leave it blank to run web search + SerpApi."
             ),
         )
         return
@@ -431,12 +495,16 @@ def preview_loaded_references():
 
 
 def clear_loaded_references():
-    global api_references
+    global api_references, reference_cache_mode, reference_cache_query
+    global reference_cache_source_key
 
     api_references = []
+    reference_cache_mode = "none"
+    reference_cache_query = ""
+    reference_cache_source_key = ""
     update_reference_status("Reference cache cleared.", WARNING)
     set_feedback(
-        "Reference cache cleared. You can fetch again or run internal overlap check.",
+        "Reference cache cleared. Fetch again, or run check with blank query for web mode.",
         WARNING,
     )
 
@@ -460,44 +528,56 @@ def toggle_match_details(details_frame, toggle_button):
         toggle_button.config(text="Hide Details")
 
 
-def request_review(text):
+def request_review(text, search_text=""):
     global plagiarized_data, plagiarized_contents, data, api_references
+    global reference_cache_mode, reference_cache_query, reference_cache_source_key
+
+    source_for_search = (search_text or text or "").strip()
+    mode, query, mode_note = resolve_reference_mode(source_for_search)
 
     references = list(api_references)
     status_message = ""
 
+    current_query_key = query.strip().lower()
+    current_source_key = build_source_cache_key(source_for_search)
+    must_refresh = (
+        mode == "url"
+        or mode != reference_cache_mode
+        or (mode in {"topic", "url"} and current_query_key != reference_cache_query)
+        or (mode == "web" and current_source_key != reference_cache_source_key)
+    )
+
+    if must_refresh:
+        references = []
+        api_references = []
+        reference_cache_mode = "none"
+        reference_cache_query = ""
+        reference_cache_source_key = ""
+
     if not references:
-        query, query_note = get_effective_reference_query(text)
-        if query:
-            if query.lower().startswith(("http://", "https://")):
-                # Update loading message for URL fetch
-                progress_label.config(text="Fetching from URL...")
-                root.update_idletasks()
-                reference, status_message = fetch_reference_from_url(query, timeout=8)
-                references = [reference] if reference else []
-            else:
-                # Update loading message for reference search
-                progress_label.config(text="Searching references...")
-                root.update_idletasks()
-                references, status_message = fetch_reference_texts(
-                    query,
-                    max_results=REFERENCE_FETCH_LIMIT,
-                    timeout=8,
-                )
-
-            if query_note:
-                status_message = f"{query_note} {status_message}".strip()
-
+        if mode == "web" and not source_for_search:
+            status_message = mode_note
+        else:
+            references, status_message = fetch_references_for_mode(mode, query, source_for_search)
             if references:
                 api_references = references
-        elif query_note:
-            status_message = query_note
+                reference_cache_mode = mode
+                reference_cache_query = (
+                    current_query_key if mode in {"topic", "url"} else ""
+                )
+                reference_cache_source_key = (
+                    current_source_key if mode == "web" else ""
+                )
 
-    # Update loading message for analysis phase
-    progress_label.config(text="Analyzing text content...")
-    root.update_idletasks()
-    
-    plagiarized_data = analyze_text_against_references(text, references)
+        if mode_note and mode_note not in status_message:
+            status_message = f"{mode_note} {status_message}".strip()
+
+    set_loading_phase("Checking against sources")
+    plagiarized_data = analyze_text_against_references(
+        text,
+        references,
+        progress_callback=set_loading_phase,
+    )
     plagiarized_contents = plagiarized_data.get("plagiarized_contents", {})
     data = plagiarized_data.get("data", [0.0, 100.0])
 
@@ -514,7 +594,10 @@ def request_review(text):
         if not note:
             note = "No external references loaded."
         set_feedback(
-            f"{note} Use a topic/URL import or compare two local files in EduReplica.",
+            (
+                f"{note} Use topic/DOI/URL input, or leave query blank for web search mode. "
+                "You can also compare two local files in EduReplica."
+            ),
             WARNING,
         )
         update_reference_status(note, WARNING)
@@ -538,7 +621,7 @@ def show_report():
 
     start_loading("Analyzing text")
     try:
-        request_review(selected_text)
+        request_review(selected_text, search_text=full_text)
     finally:
         stop_loading()
 
@@ -594,7 +677,7 @@ def show_report():
             matches_container,
             text=(
                 "No strong overlaps detected from loaded sources. "
-                "You can fetch references with a topic/DOI/URL for stronger checks."
+                "Use topic/DOI/URL input, or leave query blank for web search mode."
             ),
             fg=TEXT_MUTED,
             bg=BG_SURFACE,
@@ -853,19 +936,29 @@ def check_research():
         messagebox.showwarning("Missing Files", "Please add both reference and research files.")
         return
 
-    reference_text = process_file(ref_file)
-    research_text = process_file(text_file)
-    if not reference_text or not research_text:
-        messagebox.showwarning(
-            "Unreadable File",
-            "One or both selected files are empty or unsupported. Use .txt, .docx, or .pdf files.",
-        )
-        return
-
-    start_loading("Comparing files")
+    start_loading("Extracting files")
 
     try:
-        similarity = float(cart(ref_file, text_file))
+        set_loading_phase("Extracting and cleaning reference file")
+        reference_text = process_file(ref_file)
+
+        set_loading_phase("Extracting and cleaning research file")
+        research_text = process_file(text_file)
+        if not reference_text or not research_text:
+            messagebox.showwarning(
+                "Unreadable File",
+                "One or both selected files are empty or unsupported. Use .txt, .docx, or .pdf files.",
+            )
+            return
+
+        set_loading_phase("Checking against sources")
+        similarity = float(
+            compare_texts(
+                reference_text,
+                research_text,
+                progress_callback=set_loading_phase,
+            )
+        )
     except Exception as exc:
         messagebox.showerror("Comparison Error", str(exc))
         return
@@ -976,6 +1069,8 @@ scrollbar.pack(side=RIGHT, fill=Y)
 header = Frame(scroll_frame, bg=BG_HEADER, height=62)
 header.pack(side="top", fill=X)
 header.pack_propagate(False)
+
+loading_frame = Frame(scroll_frame, bg=BG_MAIN)
 
 home_page = Frame(scroll_frame, bg=BG_MAIN)
 review_page = Frame(scroll_frame, bg=BG_MAIN)
@@ -1113,11 +1208,13 @@ review_help = Label(
     text=(
         "How KlarityCheck works:\n"
         "1) Paste text or upload a file.\n"
-        "2) Optional: Fetch references using Topic, DOI, Title, or URL.\n"
-        "   If left blank, keywords are auto-extracted from your text.\n"
-        "3) Click 'Check Plagiarism'. If internet is down, internal overlap check still runs.\n\n"
+        "2) Topic/DOI: fetches reference docs + web sources.\n"
+        "   URL: compares only against URL content.\n"
+        "   Blank query: runs paragraph-based web search with SerpApi fallback.\n"
+        "3) 'Check Plagiarism' auto-fetches references if needed.\n\n"
         "Examples: 'climate change adaptation' | '10.1038/s41586-020-2649-2' | "
-        "'https://example.com/article'"
+        "'https://example.com/article'\n"
+        "Optional SerpApi fallback: set SERPAPI_API_KEY in .env."
     ),
     font=("Arial", 11),
     fg=TEXT_MUTED,
@@ -1131,7 +1228,7 @@ review_help.pack(anchor="w", padx=30, pady=(0, 12), fill=X)
 
 reference_label = Label(
     review_page,
-    text="Reference Query (Topic / DOI / URL)",
+    text="Reference Query (Topic / DOI / URL, optional)",
     font=("Helvetica", 14, "bold"),
     fg=TEXT_MAIN,
     bg=BG_MAIN,
@@ -1227,11 +1324,11 @@ uploaded_file_label = Label(
 )
 uploaded_file_label.pack(anchor="w", padx=30, pady=(0, 8))
 
-progress_label = Label(review_page, text="", bg=BG_MAIN, fg=ACCENT, font=("Arial", 10))
+progress_label = Label(loading_frame, text="", bg=BG_MAIN, fg=ACCENT, font=("Arial", 10))
 progress_bar = ttk.Progressbar(
-    review_page,
+    loading_frame,
     orient="horizontal",
-    length=300,
+    length=430,
     mode="determinate",
     style="Dark.Horizontal.TProgressbar",
 )
@@ -1480,6 +1577,9 @@ if not OPENAI_API_KEY:
 else:
     set_feedback("OpenAI features are enabled.", SUCCESS)
 
-update_reference_status("Ready. Fetch references or run internal check.", TEXT_MUTED)
+update_reference_status(
+    "Ready. Use topic/DOI/URL or leave query blank for web search mode.",
+    TEXT_MUTED,
+)
 show_page(home_page)
 root.mainloop()
