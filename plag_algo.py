@@ -1,4 +1,5 @@
 import re
+import math
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from html import unescape
@@ -12,6 +13,7 @@ from docx import Document
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
 SENTENCE_RE = re.compile(r"[^.!?\n]+[.!?]?")
 TAG_RE = re.compile(r"<[^>]+>")
+PARAGRAPH_RE = re.compile(r"[^\n]+(?:\n(?!\s*\n)[^\n]+)*", flags=re.MULTILINE)
 
 STOPWORDS: Set[str] = {
   "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
@@ -27,6 +29,211 @@ STOPWORDS: Set[str] = {
   "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while",
   "who", "whom", "why", "with", "would", "you", "your", "yours", "yourself", "yourselves",
 }
+
+SEMANTIC_CANONICAL_MAP: Dict[str, str] = {
+  # Common academic/technical variants mapped to a shared concept root.
+  "analyze": "analysis",
+  "analyses": "analysis",
+  "analytical": "analysis",
+  "method": "methodology",
+  "methods": "methodology",
+  "approach": "methodology",
+  "approaches": "methodology",
+  "model": "framework",
+  "models": "framework",
+  "frameworks": "framework",
+  "result": "outcome",
+  "results": "outcome",
+  "outcomes": "outcome",
+  "evidence": "finding",
+  "findings": "finding",
+  "interpret": "inference",
+  "interpretation": "inference",
+  "infer": "inference",
+  "comparison": "compare",
+  "comparing": "compare",
+  "compared": "compare",
+  "evaluation": "evaluate",
+  "evaluating": "evaluate",
+  "evaluated": "evaluate",
+  "student": "learner",
+  "students": "learner",
+  "learning": "learn",
+  "education": "learn",
+  "educational": "learn",
+}
+
+
+def _repair_character_spaced_text(text: str) -> str:
+  """Fix OCR/PDF artifacts like 'T h i s  i s  t e x t' when strongly detected."""
+  if not text:
+    return ""
+
+  alpha_tokens = re.findall(r"[A-Za-z]+", text)
+  if len(alpha_tokens) < 40:
+    return text
+
+  single_letter_ratio = (
+    sum(1 for token in alpha_tokens if len(token) == 1) / max(1, len(alpha_tokens))
+  )
+  if single_letter_ratio < 0.52:
+    return text
+
+  return re.sub(r"(?<=\b[A-Za-z])\s+(?=[A-Za-z]\b)", "", text)
+
+
+def _simple_stem(token: str) -> str:
+  token = (token or "").lower()
+  if len(token) <= 3:
+    return token
+
+  for suffix in ("ization", "ational", "fulness", "ousness", "iveness", "tional", "ement"):
+    if token.endswith(suffix) and len(token) > len(suffix) + 2:
+      return token[: -len(suffix)]
+
+  for suffix in ("ingly", "edly", "ments", "ment", "ation", "ities", "ity", "ing", "ers", "er", "ed", "ly", "es", "s"):
+    if token.endswith(suffix) and len(token) > len(suffix) + 2:
+      return token[: -len(suffix)]
+
+  return token
+
+
+def _canonical_token(token: str) -> str:
+  return SEMANTIC_CANONICAL_MAP.get(token, token)
+
+
+def _content_tokens(tokens: Sequence[str]) -> List[str]:
+  stemmed = [_simple_stem(token) for token in tokens if token]
+  content = [_canonical_token(token) for token in stemmed if token and token not in STOPWORDS]
+  return content if content else [_canonical_token(token) for token in stemmed if token]
+
+
+def _char_ngrams(text: str, n: int = 4) -> Counter:
+  normalized = _normalize_text(text)
+  if not normalized:
+    return Counter()
+  if len(normalized) <= n:
+    return Counter({normalized: 1})
+
+  return Counter(normalized[index : index + n] for index in range(len(normalized) - n + 1))
+
+
+def _counter_cosine_similarity(left: Counter, right: Counter) -> float:
+  if not left or not right:
+    return 0.0
+
+  dot = sum(value * right.get(key, 0) for key, value in left.items())
+  if dot <= 0:
+    return 0.0
+
+  left_norm = math.sqrt(sum(value * value for value in left.values()))
+  right_norm = math.sqrt(sum(value * value for value in right.values()))
+  if left_norm == 0.0 or right_norm == 0.0:
+    return 0.0
+
+  return max(0.0, min(1.0, dot / (left_norm * right_norm)))
+
+
+def _set_jaccard_similarity(left: Set[str], right: Set[str]) -> float:
+  if not left or not right:
+    return 0.0
+
+  union = left | right
+  if not union:
+    return 0.0
+  return len(left & right) / len(union)
+
+
+def _angle_similarity(cosine_value: float) -> float:
+  """Convert cosine to angle-based similarity: 1 - sin(theta)."""
+  clamped = max(0.0, min(1.0, cosine_value))
+  sine_theta = math.sqrt(max(0.0, 1.0 - (clamped * clamped)))
+  return 1.0 - sine_theta
+
+
+def _build_span_features(tokens: Sequence[str], normalized_text: str) -> Dict[str, object]:
+  content_tokens = _content_tokens(tokens)
+  content_counter = Counter(content_tokens)
+  concept_set = set(content_tokens)
+
+  return {
+    "content_tokens": content_tokens,
+    "term_freq": content_counter,
+    "concept_set": concept_set,
+    "chargrams": _char_ngrams(normalized_text, n=4),
+    "ngrams": _make_ngrams(content_tokens, n=3),
+  }
+
+
+def _span_similarity(left: Dict[str, object], right: Dict[str, object]) -> Tuple[float, Dict[str, float]]:
+  token_cos = _counter_cosine_similarity(left["term_freq"], right["term_freq"])
+  char_cos = _counter_cosine_similarity(left["chargrams"], right["chargrams"])
+  concept_jaccard = _set_jaccard_similarity(left["concept_set"], right["concept_set"])
+  sequence_ratio = SequenceMatcher(None, left["norm"], right["norm"]).ratio()
+  angle_similarity = _angle_similarity(token_cos)
+
+  # Multi-factor blend: lexical, structural, and approximate semantic alignment.
+  score = (
+    (0.34 * token_cos)
+    + (0.18 * char_cos)
+    + (0.18 * sequence_ratio)
+    + (0.18 * concept_jaccard)
+    + (0.12 * angle_similarity)
+  )
+
+  return (
+    max(0.0, min(1.0, score)),
+    {
+      "token_cos": token_cos,
+      "char_cos": char_cos,
+      "sequence": sequence_ratio,
+      "concept": concept_jaccard,
+      "angle": angle_similarity,
+    },
+  )
+
+
+def _paragraph_spans(text: str, min_words: int = 12) -> List[Dict[str, object]]:
+  paragraphs: List[Dict[str, object]] = []
+  for match in PARAGRAPH_RE.finditer(text or ""):
+    raw = _collapse_whitespace(match.group())
+    if not raw:
+      continue
+
+    tokens = _tokenize(raw)
+    if len(tokens) < min_words:
+      continue
+
+    normalized = " ".join(tokens)
+    paragraph = {
+      "raw": raw,
+      "norm": normalized,
+      "tokens": tokens,
+      "start": match.start(),
+      "end": match.end(),
+    }
+    paragraph.update(_build_span_features(tokens, normalized))
+    paragraphs.append(paragraph)
+
+  return paragraphs
+
+
+def _assign_paragraph_ids(sentences: List[Dict[str, object]], paragraphs: Sequence[Dict[str, object]]) -> None:
+  paragraph_index = 0
+  total_paragraphs = len(paragraphs)
+
+  for sentence in sentences:
+    sentence["paragraph_id"] = -1
+    if total_paragraphs == 0:
+      continue
+
+    start = int(sentence["start"])
+    while paragraph_index + 1 < total_paragraphs and start >= int(paragraphs[paragraph_index]["end"]):
+      paragraph_index += 1
+
+    paragraph = paragraphs[paragraph_index]
+    if int(paragraph["start"]) <= start < int(paragraph["end"]):
+      sentence["paragraph_id"] = paragraph_index
 
 
 def process_file(file_path: str) -> str:
@@ -46,7 +253,8 @@ def process_file(file_path: str) -> str:
   except Exception:
     return ""
 
-  return content.strip()
+  cleaned = _repair_character_spaced_text(content)
+  return cleaned.strip()
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -97,7 +305,7 @@ def _make_ngrams(tokens: Sequence[str], n: int = 3) -> set:
   return {" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
 
 
-def _sentence_spans(text: str, min_words: int = 4) -> List[Dict[str, object]]:
+def _sentence_spans(text: str, min_words: int = 3) -> List[Dict[str, object]]:
   sentences: List[Dict[str, object]] = []
   for match in SENTENCE_RE.finditer(text or ""):
     raw = _collapse_whitespace(match.group())
@@ -108,23 +316,24 @@ def _sentence_spans(text: str, min_words: int = 4) -> List[Dict[str, object]]:
     if len(tokens) < min_words:
       continue
 
-    sentences.append(
-      {
-        "raw": raw,
-        "norm": " ".join(tokens),
-        "tokens": tokens,
-        "ngrams": _make_ngrams(tokens, n=3),
-        "start": match.start(),
-        "end": match.end(),
-      }
-    )
+    normalized = " ".join(tokens)
+    sentence = {
+      "raw": raw,
+      "norm": normalized,
+      "tokens": tokens,
+      "start": match.start(),
+      "end": match.end(),
+    }
+    sentence.update(_build_span_features(tokens, normalized))
+
+    sentences.append(sentence)
   return sentences
 
 
 def _classify_match(score: float) -> str:
-  if score >= 0.93:
+  if score >= 0.92:
     return "Exact Match"
-  if score >= 0.85:
+  if score >= 0.78:
     return "Near Match"
   return "Paraphrased Overlap"
 
@@ -397,11 +606,11 @@ def _offline_self_overlap_result(
 def analyze_text_against_references(
   text: str,
   references: Sequence[Dict[str, str]],
-  min_score: float = 0.82,
+  min_score: float = 0.66,
   max_matches: int = 12,
 ) -> Dict[str, object]:
   """
-  Compare text to external references using n-gram candidate search + similarity scoring.
+  Compare text to external references with hybrid scoring over words, sentences, and paragraphs.
   Returns data ready for UI presentation.
   """
   cleaned_text = (text or "").strip()
@@ -413,7 +622,18 @@ def analyze_text_against_references(
       "note": "No text provided.",
     }
 
-  target_sentences = _sentence_spans(cleaned_text, min_words=4)
+  target_sentences = _sentence_spans(cleaned_text, min_words=3)
+  target_paragraphs = _paragraph_spans(cleaned_text, min_words=8)
+  _assign_paragraph_ids(target_sentences, target_paragraphs)
+
+  if not target_sentences:
+    return {
+      "plagiarized_contents": {},
+      "data": [0.0, 100.0],
+      "mode": "empty",
+      "note": "No valid sentence spans found in the input text.",
+    }
+
   if not references:
     return _offline_self_overlap_result(
       cleaned_text,
@@ -422,23 +642,43 @@ def analyze_text_against_references(
     )
 
   reference_sentences: List[Dict[str, object]] = []
+  reference_paragraphs: List[Dict[str, object]] = []
   ngram_index = defaultdict(set)
+  concept_index = defaultdict(set)
 
   for reference in references:
     title = _collapse_whitespace(reference.get("title", "Reference"))
     url = _collapse_whitespace(reference.get("url", ""))
     source_name = _collapse_whitespace(reference.get("source", "API"))
 
-    for sentence in _sentence_spans(reference.get("text", ""), min_words=4):
+    reference_text = _repair_character_spaced_text(reference.get("text", ""))
+    ref_paragraphs = _paragraph_spans(reference_text, min_words=8)
+    ref_sentences = _sentence_spans(reference_text, min_words=3)
+    _assign_paragraph_ids(ref_sentences, ref_paragraphs)
+
+    paragraph_offset = len(reference_paragraphs)
+    for paragraph in ref_paragraphs:
+      paragraph["title"] = title
+      paragraph["url"] = url
+      paragraph["source_name"] = source_name
+      reference_paragraphs.append(paragraph)
+
+    for sentence in ref_sentences:
       sentence["title"] = title
       sentence["url"] = url
       sentence["source_name"] = source_name
+
+      paragraph_id = int(sentence.get("paragraph_id", -1))
+      if paragraph_id >= 0:
+        sentence["paragraph_id"] = paragraph_offset + paragraph_id
 
       ref_index = len(reference_sentences)
       reference_sentences.append(sentence)
 
       for ngram in sentence["ngrams"]:
         ngram_index[ngram].add(ref_index)
+      for concept in sentence["concept_set"]:
+        concept_index[concept].add(ref_index)
 
   if not reference_sentences:
     return _offline_self_overlap_result(
@@ -447,36 +687,54 @@ def analyze_text_against_references(
       note="Loaded references had no extractable sentence content.",
     )
 
-  matches: List[Dict[str, object]] = []
+  all_matches: List[Dict[str, object]] = []
   for sentence in target_sentences:
     candidate_counter = Counter()
     for ngram in sentence["ngrams"]:
       for ref_idx in ngram_index.get(ngram, set()):
+        candidate_counter[ref_idx] += 3
+
+    for concept in sentence["concept_set"]:
+      for ref_idx in concept_index.get(concept, set()):
         candidate_counter[ref_idx] += 1
 
     if not candidate_counter:
       continue
 
-    sentence_token_set = set(sentence["tokens"])
     best_score = 0.0
     best_reference: Optional[Dict[str, object]] = None
+    sentence_parts: Dict[str, float] = {}
+    paragraph_parts: Dict[str, float] = {}
 
-    # Evaluate only the most likely candidate sentences to keep it fast.
-    for ref_idx, _hits in candidate_counter.most_common(40):
+    target_paragraph: Optional[Dict[str, object]] = None
+    target_paragraph_id = int(sentence.get("paragraph_id", -1))
+    if 0 <= target_paragraph_id < len(target_paragraphs):
+      target_paragraph = target_paragraphs[target_paragraph_id]
+
+    # Evaluate likely candidate sentences; include paragraph-context scoring.
+    for ref_idx, _hits in candidate_counter.most_common(80):
       ref_sentence = reference_sentences[ref_idx]
-      ref_token_set = set(ref_sentence["tokens"])
-      union = sentence_token_set | ref_token_set
-      jaccard = len(sentence_token_set & ref_token_set) / len(union) if union else 0.0
-      ratio = SequenceMatcher(None, sentence["norm"], ref_sentence["norm"]).ratio()
-      score = (0.60 * ratio) + (0.40 * jaccard)
+      sent_score, sent_parts = _span_similarity(sentence, ref_sentence)
+
+      paragraph_score = 0.0
+      current_paragraph_parts: Dict[str, float] = {}
+      ref_paragraph_id = int(ref_sentence.get("paragraph_id", -1))
+      if target_paragraph is not None and 0 <= ref_paragraph_id < len(reference_paragraphs):
+        ref_paragraph = reference_paragraphs[ref_paragraph_id]
+        paragraph_score, current_paragraph_parts = _span_similarity(target_paragraph, ref_paragraph)
+
+      # Combine sentence-level alignment with paragraph-level context consistency.
+      score = (0.72 * sent_score) + (0.28 * paragraph_score)
 
       if score > best_score:
         best_score = score
         best_reference = ref_sentence
+        sentence_parts = sent_parts
+        paragraph_parts = current_paragraph_parts
 
     if best_reference and best_score >= min_score:
       source_title = f"{best_reference['title']} ({best_reference['source_name']})"
-      matches.append(
+      all_matches.append(
         {
           "plagiarized_paragraph": sentence["raw"],
           "match_type": _classify_match(best_score),
@@ -484,14 +742,22 @@ def analyze_text_against_references(
           "text_start": sentence["start"],
           "text_end": sentence["end"],
           "score": round(best_score * 100, 1),
+          "sentence_cosine": round(sentence_parts.get("token_cos", 0.0) * 100, 1),
+          "sentence_sequence": round(sentence_parts.get("sequence", 0.0) * 100, 1),
+          "paragraph_context": round(paragraph_parts.get("token_cos", 0.0) * 100, 1),
         }
       )
 
-  matches.sort(key=lambda value: value["score"], reverse=True)
-  matches = matches[:max_matches]
+  all_matches.sort(key=lambda value: value["score"], reverse=True)
 
+  if max_matches <= 0:
+    display_matches = all_matches
+  else:
+    display_matches = all_matches[:max_matches]
+
+  # Coverage uses all detected matches, not only the displayed top-N list.
   coverage = [0] * len(cleaned_text)
-  for match in matches:
+  for match in all_matches:
     for index in range(match["text_start"], min(match["text_end"], len(cleaned_text))):
       coverage[index] = 1
 
@@ -499,14 +765,21 @@ def analyze_text_against_references(
   original_percent = round(max(0.0, 100 - plag_percent), 1)
 
   plagiarized_contents = {
-    f"content{index}": value for index, value in enumerate(matches, start=1)
+    f"content{index}": value for index, value in enumerate(display_matches, start=1)
   }
+
+  note = (
+    "Compared against external references with hybrid word/sentence/paragraph scoring. "
+    f"Detected {len(all_matches)} matching spans."
+  )
+  if max_matches > 0 and len(all_matches) > len(display_matches):
+    note += f" Showing top {len(display_matches)} in the UI."
 
   return {
     "plagiarized_contents": plagiarized_contents,
     "data": [plag_percent, original_percent],
     "mode": "external",
-    "note": "Compared against external references.",
+    "note": note,
   }
 
 
@@ -528,8 +801,8 @@ def check_against_reference_text(ref_file: str, text_file: str) -> float:
         "source": "Local File",
       }
     ],
-    min_score=0.74,
-    max_matches=28,
+    min_score=0.60,
+    max_matches=0,
   )
   return float(result.get("data", [0.0, 100.0])[0])
 
