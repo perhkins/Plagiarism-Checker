@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="KlarityCheck placeholder">
+  <rect width="1280" height="720" fill="#0f172a"/>
+  <text x="64" y="88" font-family="Segoe UI, Arial, sans-serif" font-size="42" fill="#f8fafc" font-weight="700">KlarityCheck Placeholder</text>
+  <text x="64" y="132" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#cbd5e1">Paste text, fetch references, run plagiarism analysis.</text>
+  <rect x="64" y="176" width="1152" height="82" rx="12" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <text x="92" y="228" font-family="Consolas, 'Courier New', monospace" font-size="22" fill="#38bdf8">Reference Query (Topic / DOI / URL)</text>
+  <rect x="64" y="286" width="1152" height="286" rx="12" fill="#111827" stroke="#64748b" stroke-width="2"/>
+  <text x="92" y="336" font-family="Segoe UI, Arial, sans-serif" font-size="22" fill="#cbd5e1">Main text input and source diagnostics area.</text>
+  <rect x="64" y="602" width="280" height="68" rx="10" fill="#2563eb"/>
+  <text x="108" y="646" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#f8fafc" font-weight="700">Check Plagiarism</text>
+</svg>

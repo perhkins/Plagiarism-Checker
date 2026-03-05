@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="EduReplica placeholder">
+  <rect width="1280" height="720" fill="#0f172a"/>
+  <text x="64" y="88" font-family="Segoe UI, Arial, sans-serif" font-size="42" fill="#f8fafc" font-weight="700">EduReplica Placeholder</text>
+  <text x="64" y="132" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#cbd5e1">Direct file-vs-file similarity with long-document chunk mode.</text>
+  <rect x="64" y="182" width="1152" height="140" rx="12" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <text x="92" y="244" font-family="Consolas, 'Courier New', monospace" font-size="20" fill="#cbd5e1">Reference File path field</text>
+  <rect x="64" y="348" width="1152" height="140" rx="12" fill="#111827" stroke="#22c55e" stroke-width="2"/>
+  <text x="92" y="410" font-family="Consolas, 'Courier New', monospace" font-size="20" fill="#cbd5e1">Research File path field</text>
+  <rect x="64" y="530" width="280" height="68" rx="10" fill="#15803d"/>
+  <text x="112" y="574" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#f8fafc" font-weight="700">Check Research</text>
+</svg>

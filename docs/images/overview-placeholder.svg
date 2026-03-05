@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-label="PaperCritic overview placeholder">
+  <rect width="1280" height="720" fill="#0f172a"/>
+  <rect x="60" y="52" width="1160" height="74" rx="10" fill="#1e293b"/>
+  <text x="90" y="98" font-family="Segoe UI, Arial, sans-serif" font-size="30" fill="#f8fafc" font-weight="700">PaperCritic - Overview Placeholder</text>
+  <rect x="60" y="160" width="560" height="230" rx="16" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="660" y="160" width="560" height="230" rx="16" fill="#111827" stroke="#22c55e" stroke-width="2"/>
+  <rect x="60" y="430" width="1160" height="230" rx="16" fill="#111827" stroke="#ef4444" stroke-width="2"/>
+  <text x="90" y="210" font-family="Segoe UI, Arial, sans-serif" font-size="26" fill="#38bdf8" font-weight="700">KlarityCheck</text>
+  <text x="690" y="210" font-family="Segoe UI, Arial, sans-serif" font-size="26" fill="#22c55e" font-weight="700">AuthentiText</text>
+  <text x="90" y="480" font-family="Segoe UI, Arial, sans-serif" font-size="26" fill="#ef4444" font-weight="700">EduReplica</text>
+  <text x="90" y="254" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Home and dashboard view</text>
+  <text x="690" y="254" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Rewrite workspace view</text>
+  <text x="90" y="524" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Local comparison workspace view</text>
+</svg>

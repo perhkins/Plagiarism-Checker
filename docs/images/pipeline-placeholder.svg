@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="Pipeline placeholder">
+  <rect width="1280" height="640" fill="#0f172a"/>
+  <text x="52" y="78" font-family="Segoe UI, Arial, sans-serif" font-size="40" fill="#f8fafc" font-weight="700">Processing Pipeline Placeholder</text>
+  <rect x="52" y="140" width="216" height="120" rx="14" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="306" y="140" width="216" height="120" rx="14" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="560" y="140" width="216" height="120" rx="14" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="814" y="140" width="216" height="120" rx="14" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="1068" y="140" width="160" height="120" rx="14" fill="#111827" stroke="#38bdf8" stroke-width="2"/>
+  <text x="86" y="208" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Ingest</text>
+  <text x="350" y="208" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Reference Fetch</text>
+  <text x="627" y="208" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Expansion</text>
+  <text x="878" y="208" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">Scoring</text>
+  <text x="1111" y="208" font-family="Segoe UI, Arial, sans-serif" font-size="20" fill="#cbd5e1">UI</text>
+  <line x1="268" y1="200" x2="306" y2="200" stroke="#22c55e" stroke-width="4"/>
+  <line x1="522" y1="200" x2="560" y2="200" stroke="#22c55e" stroke-width="4"/>
+  <line x1="776" y1="200" x2="814" y2="200" stroke="#22c55e" stroke-width="4"/>
+  <line x1="1030" y1="200" x2="1068" y2="200" stroke="#22c55e" stroke-width="4"/>
+  <text x="52" y="330" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#cbd5e1">End-to-end processing flow</text>
+</svg>
