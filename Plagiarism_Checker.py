@@ -1,4 +1,5 @@
 import os
+import re
 import webbrowser
 from pathlib import Path
 from tkinter import (
@@ -97,6 +98,31 @@ loading_message = ""
 loading_phase = 0
 loading_after_id = None
 loading_frame = None
+loading_anchor_widget = None
+loading_widgets = {}
+progress_label = None
+progress_bar = None
+
+
+def set_loading_anchor(widget):
+    global loading_anchor_widget
+    loading_anchor_widget = widget
+
+
+def set_loading_context(context):
+    global loading_frame, progress_label, progress_bar, loading_anchor_widget
+
+    if context not in loading_widgets:
+        context = "review"
+
+    widgets = loading_widgets.get(context)
+    if not widgets:
+        return
+
+    loading_frame = widgets["frame"]
+    progress_label = widgets["label"]
+    progress_bar = widgets["bar"]
+    loading_anchor_widget = None
 
 
 def set_feedback(message, color=TEXT_MUTED):
@@ -105,6 +131,9 @@ def set_feedback(message, color=TEXT_MUTED):
 
 def _animate_loading_label():
     global loading_after_id, loading_phase
+
+    if progress_label is None:
+        return
 
     dots = "." * ((loading_phase % 3) + 1)
     progress_label.config(text=f"{loading_message}{dots}")
@@ -115,11 +144,32 @@ def _animate_loading_label():
 def set_loading_phase(message):
     global loading_message, loading_phase
 
+    if loading_frame is None or progress_label is None or progress_bar is None:
+        return
+
     loading_message = message
     loading_phase = 0
 
     if loading_frame is not None and not loading_frame.winfo_manager():
-        loading_frame.pack(after=header, fill=X, padx=30, pady=(6, 4))
+        anchor_widget = loading_anchor_widget
+        if anchor_widget is not None:
+            try:
+                if (not anchor_widget.winfo_exists()) or (anchor_widget.master != loading_frame.master):
+                    anchor_widget = None
+            except Exception:
+                anchor_widget = None
+
+        if anchor_widget is None and "plag_check_button" in globals():
+            try:
+                if plag_check_button.winfo_exists() and plag_check_button.master == loading_frame.master:
+                    anchor_widget = plag_check_button
+            except Exception:
+                anchor_widget = None
+
+        if anchor_widget is not None:
+            loading_frame.pack(after=anchor_widget, fill=X, padx=30, pady=(0, 8))
+        else:
+            loading_frame.pack(fill=X, padx=30, pady=(0, 8))
     if not progress_label.winfo_manager():
         progress_label.pack(anchor="w")
     if not progress_bar.winfo_manager():
@@ -135,6 +185,9 @@ def set_loading_phase(message):
 def start_loading(message):
     global loading_after_id
 
+    if loading_frame is None or progress_label is None or progress_bar is None:
+        return
+
     set_loading_phase(message)
 
     progress_bar.config(mode="indeterminate")
@@ -148,6 +201,9 @@ def start_loading(message):
 
 def stop_loading():
     global loading_after_id
+
+    if loading_frame is None or progress_label is None or progress_bar is None:
+        return
 
     if loading_after_id:
         try:
@@ -348,6 +404,9 @@ def rewrite_with_tone(text, tone):
 
 
 def file_upload():
+    set_loading_context("review")
+    set_loading_anchor(file_upload_button)
+
     file_path = filedialog.askopenfilename(
         title="Select a file",
         filetypes=[("Supported Files", "*.txt *.docx *.pdf"), ("All Files", "*.*")],
@@ -426,6 +485,9 @@ def fetch_references_for_mode(mode, query, source_text):
 def import_references():
     global api_references, reference_cache_mode, reference_cache_query
     global reference_cache_source_key
+
+    set_loading_context("review")
+    set_loading_anchor(reference_btn_frame)
 
     source_text = text_box.get("1.0", END).strip()
     mode, query, mode_note = resolve_reference_mode(source_text)
@@ -603,17 +665,54 @@ def request_review(text, search_text=""):
         update_reference_status(note, WARNING)
 
 
+def _build_analysis_text(full_text, max_words=2400):
+    """Build analysis payload for long documents using distributed word segments."""
+    words = (full_text or "").split()
+    if len(words) <= max_words:
+        return full_text, False
+
+    segment_words = max(500, max_words // 3)
+    starts = [
+        0,
+        max(0, (len(words) // 2) - (segment_words // 2)),
+        max(0, len(words) - segment_words),
+    ]
+
+    sampled_parts = []
+    seen = set()
+    for start in starts:
+        segment = words[start : start + segment_words]
+        if not segment:
+            continue
+        segment_text = " ".join(segment)
+        key = re.sub(r"\s+", " ", segment_text).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            sampled_parts.append(segment_text)
+
+    sampled_text = "\n\n".join(sampled_parts).strip()
+    return (sampled_text if sampled_text else " ".join(words[:max_words])), True
+
+
 def show_report():
     global full_text
 
+    set_loading_context("review")
+    set_loading_anchor(plag_check_button)
+
     full_text = text_box.get("1.0", END).strip()
-    words = full_text.split()
-    selected_text = " ".join(words[:1200]) if len(words) > 1200 else full_text
+    selected_text, sampled_long_text = _build_analysis_text(full_text, max_words=2400)
 
     if not full_text or full_text == "Kindly enter a text to check for plagiarism.":
         text_box.delete("1.0", END)
         text_box.insert(END, "Kindly enter a text to check for plagiarism.\n")
         return
+
+    if sampled_long_text:
+        set_feedback(
+            "Large document detected. Analyzing distributed segments across the file for better accuracy.",
+            TEXT_MUTED,
+        )
 
     text_box.config(state="disabled")
     for widget in report_frame.winfo_children():
@@ -866,7 +965,14 @@ def rewrite_func(text, tone):
     for widget in modified_text_frame.winfo_children():
         widget.destroy()
 
-    rewritten_text = rewrite_with_tone(check_text, selected_tone)
+    set_loading_context("rewrite")
+    set_loading_anchor(rewrite_btn)
+    start_loading("Rewriting text")
+    try:
+        set_loading_phase("Generating rewritten draft")
+        rewritten_text = rewrite_with_tone(check_text, selected_tone)
+    finally:
+        stop_loading()
 
     modified_text_frame.pack(fill=BOTH, expand=True)
     line_divider = Frame(modified_text_frame, bg=SUCCESS, height=5)
@@ -932,6 +1038,9 @@ def get_filepath(file_slot):
 
 
 def check_research():
+    set_loading_context("research")
+    set_loading_anchor(cart_button)
+
     if not ref_file or not text_file:
         messagebox.showwarning("Missing Files", "Please add both reference and research files.")
         return
@@ -1038,6 +1147,19 @@ ttk_style.configure(
     darkcolor=ACCENT,
 )
 
+
+def _create_loading_widgets(parent):
+    frame = Frame(parent, bg=BG_MAIN)
+    label = Label(frame, text="", bg=BG_MAIN, fg=ACCENT, font=("Arial", 10))
+    bar = ttk.Progressbar(
+        frame,
+        orient="horizontal",
+        length=430,
+        mode="determinate",
+        style="Dark.Horizontal.TProgressbar",
+    )
+    return frame, label, bar
+
 canvas = Canvas(root, bg=BG_MAIN, highlightthickness=0)
 scrollbar = Scrollbar(root, orient="vertical", command=canvas.yview)
 scroll_frame = Frame(canvas, bg=BG_MAIN)
@@ -1069,8 +1191,6 @@ scrollbar.pack(side=RIGHT, fill=Y)
 header = Frame(scroll_frame, bg=BG_HEADER, height=62)
 header.pack(side="top", fill=X)
 header.pack_propagate(False)
-
-loading_frame = Frame(scroll_frame, bg=BG_MAIN)
 
 home_page = Frame(scroll_frame, bg=BG_MAIN)
 review_page = Frame(scroll_frame, bg=BG_MAIN)
@@ -1324,14 +1444,30 @@ uploaded_file_label = Label(
 )
 uploaded_file_label.pack(anchor="w", padx=30, pady=(0, 8))
 
-progress_label = Label(loading_frame, text="", bg=BG_MAIN, fg=ACCENT, font=("Arial", 10))
-progress_bar = ttk.Progressbar(
-    loading_frame,
-    orient="horizontal",
-    length=430,
-    mode="determinate",
-    style="Dark.Horizontal.TProgressbar",
+loading_frame, progress_label, progress_bar = _create_loading_widgets(review_page)
+rewrite_loading_frame, rewrite_progress_label, rewrite_progress_bar = _create_loading_widgets(rewrite_page)
+research_loading_frame, research_progress_label, research_progress_bar = _create_loading_widgets(research_page)
+
+loading_widgets.update(
+    {
+        "review": {
+            "frame": loading_frame,
+            "label": progress_label,
+            "bar": progress_bar,
+        },
+        "rewrite": {
+            "frame": rewrite_loading_frame,
+            "label": rewrite_progress_label,
+            "bar": rewrite_progress_bar,
+        },
+        "research": {
+            "frame": research_loading_frame,
+            "label": research_progress_label,
+            "bar": research_progress_bar,
+        },
+    }
 )
+set_loading_context("review")
 
 feedback_label = Label(
     review_page,

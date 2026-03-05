@@ -1,6 +1,7 @@
 import os
 import re
 import math
+from io import BytesIO
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from html import unescape
@@ -82,6 +83,39 @@ def _repair_character_spaced_text(text: str) -> str:
     return text
 
   return re.sub(r"(?<=\b[A-Za-z])\s+(?=[A-Za-z]\b)", "", text)
+
+
+def _normalize_extracted_text(text: str) -> str:
+  """Normalize common PDF/OCR artifacts before tokenization and matching."""
+  if not text:
+    return ""
+
+  replacements = {
+    "\ufb00": "ff",  # ligatures
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\u2018": "'",   # smart quotes
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2013": "-",   # dashes
+    "\u2014": "-",
+    "\u2212": "-",
+    "\u00a0": " ",   # nbsp
+    "\u200b": "",    # zero-width
+  }
+  normalized = text
+  for source, target in replacements.items():
+    normalized = normalized.replace(source, target)
+
+  normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+  # Rejoin words split by hyphen across wrapped PDF lines.
+  normalized = re.sub(r"([A-Za-z])\-\s*\n\s*([A-Za-z])", r"\1\2", normalized)
+  # Remove isolated page-number lines.
+  normalized = re.sub(r"(?m)^\s*\d{1,4}\s*$", "", normalized)
+  return normalized
 
 
 def _simple_stem(token: str) -> str:
@@ -255,6 +289,7 @@ def process_file(file_path: str) -> str:
   except Exception:
     return ""
 
+  content = _normalize_extracted_text(content)
   cleaned = _repair_character_spaced_text(content)
   return cleaned.strip()
 
@@ -432,18 +467,68 @@ def _deduplicate_reference_items(
   return deduplicated
 
 
+def _reference_similarity_snapshot(
+  source_text: str,
+  references: Sequence[Dict[str, str]],
+) -> Tuple[float, int]:
+  """Run a quick overlap check to decide whether fetched sources are relevant."""
+  cleaned_source = _repair_character_spaced_text(
+    _normalize_extracted_text(source_text or "")
+  ).strip()
+  if not cleaned_source or not references:
+    return 0.0, 0
+
+  try:
+    result = analyze_text_against_references(
+      text=cleaned_source,
+      references=references,
+      min_score=0.56,
+      max_matches=6,
+      progress_callback=None,
+    )
+  except Exception:
+    return 0.0, 0
+
+  score = float((result.get("data") or [0.0])[0] or 0.0)
+  matches = len((result.get("plagiarized_contents") or {}))
+  return score, matches
+
+
+def _compact_issue_summary(issues: Sequence[str], max_items: int = 3) -> str:
+  ordered_unique: List[str] = []
+  seen = set()
+  for issue in issues:
+    cleaned = _collapse_whitespace(issue)
+    if not cleaned or cleaned in seen:
+      continue
+    seen.add(cleaned)
+    ordered_unique.append(cleaned)
+
+  if not ordered_unique:
+    return ""
+  if len(ordered_unique) <= max_items:
+    return "; ".join(ordered_unique)
+  return "; ".join(ordered_unique[:max_items]) + "; ..."
+
+
 def _fetch_firsthand_web_sources(
   queries: Sequence[str],
   timeout: int,
   max_results: int,
+  source_text: str = "",
   progress_callback: Optional[Callable[[str], None]] = None,
-) -> Tuple[List[Dict[str, str]], List[str], str]:
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[str], str, str, float]:
   issues: List[str] = []
+  best_fallback: List[Dict[str, str]] = []
+  best_fallback_source = ""
+  best_fallback_score = -1.0
+
   providers: Sequence[Tuple[str, Callable[..., List[Dict[str, str]]]]] = (
     ("DuckDuckGo", fetch_duckduckgo_results),
     ("Grokipedia", fetch_grokipedia_results),
     ("Wikipedia", fetch_wikipedia_results),
   )
+  accept_score_floor = 1.5
 
   for source_name, provider in providers:
     _emit_progress(progress_callback, f"Collecting web sources: {source_name}")
@@ -469,54 +554,107 @@ def _fetch_firsthand_web_sources(
         break
 
     source_results = _deduplicate_reference_items(source_results, max_results=max_results)
-    if source_results:
-      return source_results, issues, source_name
+    if not source_results:
+      continue
 
-  return [], issues, ""
+    if not source_text:
+      return source_results, best_fallback, issues, source_name, best_fallback_source, best_fallback_score
+
+    _emit_progress(progress_callback, f"Evaluating source relevance: {source_name}")
+    similarity_score, similarity_matches = _reference_similarity_snapshot(
+      source_text,
+      source_results,
+    )
+
+    if similarity_matches > 0 or similarity_score >= accept_score_floor:
+      return source_results, best_fallback, issues, source_name, best_fallback_source, best_fallback_score
+
+    if similarity_score > best_fallback_score:
+      best_fallback = list(source_results)
+      best_fallback_source = source_name
+      best_fallback_score = similarity_score
+
+    issues.append(
+      f"{source_name} returned low-overlap sources; checking next provider."
+    )
+
+  return [], best_fallback, issues, "", best_fallback_source, best_fallback_score
 
 
 def _fetch_web_sources_for_queries(
   queries: Sequence[str],
   timeout: int,
   serpapi_api_key: str,
+  source_text: str = "",
   max_results: int = 3,
   progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Dict[str, str]], List[str], str]:
   if not queries:
     return [], ["No paragraph query available for web search."], ""
 
-  first_hand_results, issues, first_hand_source = _fetch_firsthand_web_sources(
+  first_hand_results, first_hand_fallback, issues, first_hand_source, fallback_source, fallback_score = _fetch_firsthand_web_sources(
     queries=queries,
     timeout=timeout,
     max_results=max_results,
+    source_text=source_text,
     progress_callback=progress_callback,
   )
   if first_hand_results:
     return first_hand_results, issues, first_hand_source
 
-  if not serpapi_api_key:
-    issues.append("SerpApi unavailable (missing SERPAPI_API_KEY)")
-    return [], issues, ""
-
-  _emit_progress(progress_callback, "Collecting web sources: SerpApi fallback")
   serpapi_results: List[Dict[str, str]] = []
-  for query in queries:
-    fetched = fetch_serpapi_results(
-      query,
-      api_key=serpapi_api_key,
-      max_results=max_results,
-      timeout=min(timeout, 7),
-    )
-    if not fetched:
-      continue
+  serpapi_score = -1.0
+  serpapi_matches = 0
 
-    serpapi_results.extend(fetched)
-    serpapi_results = _deduplicate_reference_items(serpapi_results, max_results=max_results)
-    if len(serpapi_results) >= max_results:
-      break
+  if serpapi_api_key:
+    _emit_progress(progress_callback, "Collecting web sources: SerpApi fallback")
+    for query in queries:
+      fetched = fetch_serpapi_results(
+        query,
+        api_key=serpapi_api_key,
+        max_results=max_results,
+        timeout=min(timeout, 7),
+      )
+      if not fetched:
+        continue
+
+      serpapi_results.extend(fetched)
+      serpapi_results = _deduplicate_reference_items(serpapi_results, max_results=max_results)
+      if len(serpapi_results) >= max_results:
+        break
+
+    if serpapi_results and source_text:
+      _emit_progress(progress_callback, "Evaluating source relevance: SerpApi")
+      serpapi_score, serpapi_matches = _reference_similarity_snapshot(
+        source_text,
+        serpapi_results,
+      )
+      if serpapi_matches > 0 or serpapi_score >= 1.5:
+        return serpapi_results, issues, "SerpApi"
+    elif serpapi_results:
+      return serpapi_results, issues, "SerpApi"
+  else:
+    issues.append("SerpApi unavailable (missing SERPAPI_API_KEY)")
+
+  if first_hand_fallback and serpapi_results:
+    if fallback_score >= serpapi_score:
+      issues.append(
+        f"Using {fallback_source} fallback results after low overlap across providers."
+      )
+      return first_hand_fallback, issues, fallback_source
+
+    issues.append("Using SerpApi fallback results after low overlap across providers.")
+    return serpapi_results, issues, "SerpApi"
 
   if serpapi_results:
+    issues.append("SerpApi returned low-overlap sources.")
     return serpapi_results, issues, "SerpApi"
+
+  if first_hand_fallback:
+    issues.append(
+      f"Using {fallback_source} fallback results after low overlap across first-hand providers."
+    )
+    return first_hand_fallback, issues, fallback_source
 
   return [], issues, ""
 
@@ -837,6 +975,45 @@ def fetch_serpapi_results(query: str, api_key: str = "", max_results: int = 10, 
   return results
 
 
+def _looks_like_pdf_source(url: str, content_type: str = "") -> bool:
+  parsed_path = (urlparse(url).path or "").lower()
+  lowered_type = (content_type or "").lower()
+  return parsed_path.endswith(".pdf") or "application/pdf" in lowered_type
+
+
+def _extract_pdf_text_from_bytes(
+  payload: bytes,
+  max_pages: int = 40,
+  max_chars: int = 22000,
+) -> str:
+  """Extract readable text from PDF bytes with conservative caps for speed."""
+  if not payload:
+    return ""
+
+  try:
+    reader = PdfReader(BytesIO(payload))
+  except Exception:
+    return ""
+
+  chunks: List[str] = []
+  char_count = 0
+  for page_index, page in enumerate(reader.pages):
+    if page_index >= max_pages or char_count >= max_chars:
+      break
+
+    extracted = _normalize_extracted_text(page.extract_text() or "")
+    cleaned = _collapse_whitespace(extracted)
+    if len(cleaned) < 20:
+      continue
+
+    remaining = max_chars - char_count
+    piece = cleaned[:remaining]
+    chunks.append(piece)
+    char_count += len(piece)
+
+  return "\n".join(chunks).strip()
+
+
 def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[str, str]], str]:
   """Fetch plain text content from a URL as a manual reference source."""
   try:
@@ -848,6 +1025,30 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
     response.raise_for_status()
   except requests.RequestException as exc:
     return None, f"Unable to fetch URL source: {exc}"
+
+  content_type = _collapse_whitespace(response.headers.get("Content-Type", "")).lower()
+  cleaned_url = _collapse_whitespace(url)
+
+  if _looks_like_pdf_source(cleaned_url, content_type):
+    pdf_text = _extract_pdf_text_from_bytes(
+      response.content,
+      max_pages=60,
+      max_chars=30000,
+    )
+    if len(pdf_text) < 180:
+      return None, "Unable to extract enough readable text from the PDF URL."
+
+    parsed = urlparse(cleaned_url)
+    pdf_name = os.path.basename(unquote(parsed.path)) or "PDF Source"
+    return (
+      {
+        "title": pdf_name,
+        "url": cleaned_url,
+        "text": pdf_text,
+        "source": "URL Import",
+      },
+      "URL PDF source imported successfully.",
+    )
 
   html_text = response.text
   title_match = re.search(
@@ -900,6 +1101,21 @@ def _fetch_readable_text_from_url(
   except requests.RequestException:
     return "", ""
 
+  content_type = _collapse_whitespace(response.headers.get("Content-Type", "")).lower()
+
+  if _looks_like_pdf_source(cleaned_url, content_type):
+    extracted = _extract_pdf_text_from_bytes(
+      response.content,
+      max_pages=40,
+      max_chars=max_chars,
+    )
+    if len(extracted) < 260:
+      return "", ""
+
+    parsed = urlparse(cleaned_url)
+    pdf_title = os.path.basename(unquote(parsed.path)) or "PDF Source"
+    return pdf_title, extracted
+
   html_text = response.text or ""
   if len(html_text) < 200:
     return "", ""
@@ -927,7 +1143,7 @@ def _expand_web_references_with_page_text(
   timeout: int,
   progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Dict[str, str]], int]:
-  """Replace short snippets with fetched page text for top web references."""
+  """Merge fetched page text with snippets for richer and more reliable matching."""
   expanded_references: List[Dict[str, str]] = []
   expanded_count = 0
   total = len(references)
@@ -936,6 +1152,7 @@ def _expand_web_references_with_page_text(
     current = dict(reference)
     source_name = _collapse_whitespace(current.get("source", ""))
     url = _collapse_whitespace(current.get("url", ""))
+    snippet_text = _collapse_whitespace(current.get("text", ""))
 
     if source_name in {"DuckDuckGo", "Grokipedia", "SerpApi", "Wikipedia"} and url:
       _emit_progress(progress_callback, f"Expanding web pages ({index}/{total})")
@@ -944,7 +1161,14 @@ def _expand_web_references_with_page_text(
         timeout=min(timeout, 8),
       )
       if len(page_text) >= 260:
-        current["text"] = page_text
+        if snippet_text:
+          if snippet_text.lower() in page_text.lower():
+            current["text"] = page_text
+          else:
+            current["text"] = f"{snippet_text}\n\n{page_text}"
+          current["snippet"] = snippet_text
+        else:
+          current["text"] = page_text
         if page_title and len(page_title) >= 4:
           current["title"] = page_title[:200]
         expanded_count += 1
@@ -985,6 +1209,7 @@ def fetch_web_reference_texts(
     queries=web_queries,
     timeout=timeout,
     serpapi_api_key=serpapi_api_key,
+    source_text=cleaned_source_text,
     max_results=max(1, min(3, max_results)),
     progress_callback=progress_callback,
   )
@@ -1009,9 +1234,9 @@ def fetch_web_reference_texts(
       "Search order: DuckDuckGo -> Grokipedia -> Wikipedia -> SerpApi fallback."
     )
     if expanded_pages > 0:
-      message += f" Expanded {expanded_pages} web pages for deeper comparison."
+      message += f" Expanded {expanded_pages} web pages/PDFs for deeper comparison."
     if issues:
-      message += " Some providers were unavailable during lookup."
+      message += " " + _compact_issue_summary(issues)
     if not serpapi_api_key and source_used != "SerpApi":
       message += " SerpApi fallback is disabled (missing SERPAPI_API_KEY)."
     return web_results, message
@@ -1020,7 +1245,7 @@ def fetch_web_reference_texts(
     issues.append("SerpApi unavailable (missing SERPAPI_API_KEY)")
 
   if issues:
-    return [], "No web references found. " + "; ".join(sorted(set(issues)))
+    return [], "No web references found. " + _compact_issue_summary(issues, max_items=5)
 
   return [], "No web references found from DuckDuckGo, Grokipedia, Wikipedia, or SerpApi."
 
@@ -1173,6 +1398,7 @@ def fetch_reference_texts(
     queries=web_queries,
     timeout=timeout,
     serpapi_api_key=serpapi_api_key,
+    source_text=source_text,
     max_results=3,
     progress_callback=progress_callback,
   )
@@ -1224,9 +1450,9 @@ def fetch_reference_texts(
     if web_refs:
       message += f" Web references shown: {len(web_refs)} (max 3)."
     if expanded_pages > 0:
-      message += f" Expanded {expanded_pages} web pages for deeper comparison."
+      message += f" Expanded {expanded_pages} web pages/PDFs for deeper comparison."
     if issues:
-      message += " Some sources were unavailable, but fallback succeeded."
+      message += " " + _compact_issue_summary(issues)
     if hints:
       message += " " + " ".join(hints)
     return blended, message
@@ -1237,7 +1463,7 @@ def fetch_reference_texts(
       [],
       "Unable to load API references right now. "
       "Check your internet and try again, or use local files. "
-      + "; ".join(issues)
+      + _compact_issue_summary(issues, max_items=6)
       + (f" {base_message}" if base_message else ""),
     )
 
@@ -1298,7 +1524,9 @@ def analyze_text_against_references(
   Compare text to external references with hybrid scoring over words, sentences, and paragraphs.
   Returns data ready for UI presentation.
   """
-  cleaned_text = (text or "").strip()
+  cleaned_text = _repair_character_spaced_text(
+    _normalize_extracted_text(text or "")
+  ).strip()
   if not cleaned_text:
     return {
       "plagiarized_contents": {},
@@ -1346,7 +1574,9 @@ def analyze_text_against_references(
         f"Indexing source passages ({ref_number}/{total_references})",
       )
 
-    reference_text = _repair_character_spaced_text(reference.get("text", ""))
+    reference_text = _repair_character_spaced_text(
+      _normalize_extracted_text(reference.get("text", ""))
+    )
     ref_paragraphs = _paragraph_spans(reference_text, min_words=8)
     ref_sentences = _sentence_spans(reference_text, min_words=3)
     _assign_paragraph_ids(ref_sentences, ref_paragraphs)
@@ -1484,6 +1714,9 @@ def analyze_text_against_references(
       coverage[index] = 1
 
   plag_percent = round((sum(coverage) / max(1, len(cleaned_text))) * 100, 1)
+  if all_matches and plag_percent == 0.0:
+    # Avoid presenting 0.0 when overlaps exist but the document is very large.
+    plag_percent = 0.1
   original_percent = round(max(0.0, 100 - plag_percent), 1)
 
   plagiarized_contents = {
@@ -1519,8 +1752,12 @@ def compare_texts(
   progress_callback: Optional[Callable[[str], None]] = None,
 ) -> float:
   """Compare already loaded text strings and return plagiarism percent."""
-  ref_text = _repair_character_spaced_text(reference_text or "").strip()
-  cleaned_text = _repair_character_spaced_text(text or "").strip()
+  ref_text = _repair_character_spaced_text(
+    _normalize_extracted_text(reference_text or "")
+  ).strip()
+  cleaned_text = _repair_character_spaced_text(
+    _normalize_extracted_text(text or "")
+  ).strip()
 
   if not ref_text or not cleaned_text:
     return 0.0
