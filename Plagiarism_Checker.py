@@ -363,30 +363,17 @@ def suggest_improvement(text):
     if not cleaned:
         return fallback
 
-    if not client:
-        return fallback
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a plagiarism expert. Suggest one concise improvement to reduce "
-                        "plagiarism risk in the provided text. Do not rewrite the text."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Suggest one way to improve this paragraph:\n\n{cleaned}",
-                },
-            ],
-        )
-        suggestion = (response.choices[0].message.content or "").strip()
-        return suggestion or fallback
-    except Exception:
-        return fallback
+    system_prompt = (
+        "You are a plagiarism expert. Suggest one concise improvement to reduce "
+        "plagiarism risk in the provided text. Do not rewrite the text."
+    )
+    user_prompt = f"Suggest one way to improve this paragraph:\n\n{cleaned}"
+    suggestion, _provider_errors = _generate_text_with_fallback(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+    )
+    return suggestion or fallback
 
 
 def _extract_chat_response_text(payload):
@@ -421,6 +408,7 @@ def _rewrite_with_provider_http(
     system_prompt,
     user_prompt,
     extra_headers=None,
+    temperature=0.35,
     timeout=35,
 ):
     if not api_key:
@@ -435,7 +423,7 @@ def _rewrite_with_provider_http(
 
     payload = {
         "model": model,
-        "temperature": 0.35,
+        "temperature": temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -454,6 +442,76 @@ def _rewrite_with_provider_http(
         return rewritten, ""
 
     return "", f"{provider_name}: empty response"
+
+
+def _provider_fallback_chain():
+    return [
+        (
+            "OpenRouter",
+            "https://openrouter.ai/api/v1/chat/completions",
+            OPENROUTER_API_KEY,
+            os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free").strip() or "meta-llama/llama-3.1-8b-instruct:free",
+            {
+                "HTTP-Referer": "https://papercritic.local",
+                "X-Title": "PaperCritic",
+            },
+        ),
+        (
+            "Groq",
+            "https://api.groq.com/openai/v1/chat/completions",
+            GROQ_API_KEY,
+            os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant",
+            None,
+        ),
+        (
+            "Together",
+            "https://api.together.xyz/v1/chat/completions",
+            TOGETHER_API_KEY,
+            os.getenv("TOGETHER_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").strip() or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+            None,
+        ),
+    ]
+
+
+def _generate_text_with_fallback(system_prompt, user_prompt, temperature=0.35):
+    provider_errors = []
+
+    if client:
+        try:
+            response = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            rewritten = (response.choices[0].message.content or "").strip()
+            if rewritten:
+                return rewritten, provider_errors
+        except Exception as exc:
+            provider_errors.append(f"OpenAI: {exc.__class__.__name__}")
+
+    for name, endpoint, api_key, model, headers in _provider_fallback_chain():
+        if not api_key:
+            continue
+
+        rewritten, error_message = _rewrite_with_provider_http(
+            provider_name=name,
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            extra_headers=headers,
+            temperature=temperature,
+        )
+        if rewritten:
+            return rewritten, provider_errors
+        if error_message:
+            provider_errors.append(error_message)
+
+    return "", provider_errors
 
 
 def _local_tone_rewrite(text, tone):
@@ -517,66 +575,13 @@ def rewrite_with_tone(text, tone):
     )
     user_prompt = f"Rewrite this text in a {selected_tone} tone:\n\n{cleaned}"
 
-    provider_errors = []
-
-    if client:
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            rewritten = (response.choices[0].message.content or "").strip()
-            if rewritten:
-                return rewritten
-        except Exception as exc:
-            provider_errors.append(f"OpenAI: {exc.__class__.__name__}")
-
-    provider_chain = [
-        (
-            "OpenRouter",
-            "https://openrouter.ai/api/v1/chat/completions",
-            OPENROUTER_API_KEY,
-            os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free").strip() or "meta-llama/llama-3.1-8b-instruct:free",
-            {
-                "HTTP-Referer": "https://papercritic.local",
-                "X-Title": "PaperCritic",
-            },
-        ),
-        (
-            "Groq",
-            "https://api.groq.com/openai/v1/chat/completions",
-            GROQ_API_KEY,
-            os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant",
-            None,
-        ),
-        (
-            "Together",
-            "https://api.together.xyz/v1/chat/completions",
-            TOGETHER_API_KEY,
-            os.getenv("TOGETHER_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo").strip() or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-            None,
-        ),
-    ]
-
-    for name, endpoint, api_key, model, headers in provider_chain:
-        if not api_key:
-            continue
-        rewritten, error_message = _rewrite_with_provider_http(
-            provider_name=name,
-            endpoint=endpoint,
-            api_key=api_key,
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            extra_headers=headers,
-        )
-        if rewritten:
-            return rewritten
-        if error_message:
-            provider_errors.append(error_message)
+    rewritten, provider_errors = _generate_text_with_fallback(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.35,
+    )
+    if rewritten:
+        return rewritten
 
     local_rewrite = _local_tone_rewrite(cleaned, selected_tone)
     if local_rewrite:
