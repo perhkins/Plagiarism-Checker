@@ -1,6 +1,7 @@
 import os
 import re
 import webbrowser
+from collections import Counter, defaultdict
 from pathlib import Path
 from tkinter import (
     BOTH,
@@ -92,6 +93,21 @@ BUTTON_SUCCESS = "#15803d"
 BUTTON_DANGER = "#b91c1c"
 REFERENCE_FETCH_LIMIT = 24
 DETAILS_COLLAPSED_PREVIEW = 170
+EDUREPLICA_LONG_DOC_THRESHOLD = 5500
+EDUREPLICA_CHUNK_WORDS = 260
+EDUREPLICA_CHUNK_STRIDE = 190
+EDUREPLICA_MAX_CHUNKS = 180
+EDUREPLICA_CHUNK_SELECTION_LIMIT = 14
+EDUREPLICA_MAX_WORDS_PER_SIDE = 5200
+
+EDUREPLICA_STOPWORDS = {
+    "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at",
+    "be", "been", "but", "by", "can", "do", "for", "from", "had", "has", "have",
+    "if", "in", "into", "is", "it", "its", "more", "most", "no", "not", "of", "on",
+    "or", "our", "out", "over", "so", "such", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "this", "to", "too", "under", "up", "was", "we",
+    "were", "what", "when", "which", "while", "with", "you", "your",
+}
 
 
 loading_message = ""
@@ -694,6 +710,198 @@ def _build_analysis_text(full_text, max_words=2400):
     return (sampled_text if sampled_text else " ".join(words[:max_words])), True
 
 
+def _chunk_token_set(text):
+    tokens = re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+    return {
+        token
+        for token in tokens
+        if len(token) >= 4 and not token.isdigit() and token not in EDUREPLICA_STOPWORDS
+    }
+
+
+def _build_word_chunks(
+    text,
+    chunk_words=EDUREPLICA_CHUNK_WORDS,
+    stride_words=EDUREPLICA_CHUNK_STRIDE,
+    max_chunks=EDUREPLICA_MAX_CHUNKS,
+):
+    words = (text or "").split()
+    if not words:
+        return [], 0
+
+    if len(words) <= chunk_words:
+        merged = " ".join(words)
+        return [
+            {
+                "index": 0,
+                "start": 0,
+                "end": len(words),
+                "text": merged,
+                "token_set": _chunk_token_set(merged),
+            }
+        ], len(words)
+
+    chunks = []
+    chunk_index = 0
+    for start in range(0, len(words), max(1, stride_words)):
+        end = min(len(words), start + chunk_words)
+        if end <= start:
+            continue
+
+        segment_text = " ".join(words[start:end]).strip()
+        if not segment_text:
+            continue
+
+        chunks.append(
+            {
+                "index": chunk_index,
+                "start": start,
+                "end": end,
+                "text": segment_text,
+                "token_set": _chunk_token_set(segment_text),
+            }
+        )
+        chunk_index += 1
+
+        if end >= len(words) or len(chunks) >= max_chunks:
+            break
+
+    return chunks, len(words)
+
+
+def _anchor_chunk_indexes(total_chunks):
+    if total_chunks <= 0:
+        return set()
+
+    anchors = {0, total_chunks // 2, total_chunks - 1}
+    if total_chunks > 4:
+        anchors.add(total_chunks // 4)
+        anchors.add((total_chunks * 3) // 4)
+
+    return {index for index in anchors if 0 <= index < total_chunks}
+
+
+def _join_selected_chunks(chunks, selected_indexes, max_words):
+    if not chunks or not selected_indexes or max_words <= 0:
+        return "", 0
+
+    assembled = []
+    used_words = 0
+    for index in sorted(selected_indexes):
+        if not (0 <= index < len(chunks)):
+            continue
+
+        remaining = max_words - used_words
+        if remaining <= 0:
+            break
+
+        words = chunks[index]["text"].split()
+        if not words:
+            continue
+
+        section = " ".join(words[:remaining]).strip()
+        if not section:
+            continue
+
+        assembled.append(section)
+        used_words += len(section.split())
+
+    return "\n\n".join(assembled).strip(), used_words
+
+
+def _prepare_edureplica_comparison_texts(reference_text, research_text):
+    ref_chunks, ref_word_count = _build_word_chunks(reference_text)
+    research_chunks, research_word_count = _build_word_chunks(research_text)
+    max_word_count = max(ref_word_count, research_word_count)
+
+    base_meta = {
+        "used_chunking": False,
+        "reference_word_count": ref_word_count,
+        "research_word_count": research_word_count,
+        "reference_chunk_count": len(ref_chunks),
+        "research_chunk_count": len(research_chunks),
+        "reference_chunks_used": len(ref_chunks),
+        "research_chunks_used": len(research_chunks),
+    }
+
+    if max_word_count < EDUREPLICA_LONG_DOC_THRESHOLD:
+        return reference_text, research_text, base_meta
+
+    if not ref_chunks or not research_chunks:
+        return reference_text, research_text, base_meta
+
+    reference_token_index = defaultdict(set)
+    for ref_index, chunk in enumerate(ref_chunks):
+        for token in chunk["token_set"]:
+            reference_token_index[token].add(ref_index)
+
+    ranked_pairs = []
+    for research_index, research_chunk in enumerate(research_chunks):
+        token_set = research_chunk["token_set"]
+        if not token_set:
+            continue
+
+        candidate_hits = Counter()
+        for token in token_set:
+            for ref_index in reference_token_index.get(token, set()):
+                candidate_hits[ref_index] += 1
+
+        if not candidate_hits:
+            continue
+
+        best_ref_index, overlap_hits = candidate_hits.most_common(1)[0]
+        ref_token_count = max(1, len(ref_chunks[best_ref_index]["token_set"]))
+        overlap_score = overlap_hits / max(1.0, (len(token_set) * ref_token_count) ** 0.5)
+        if overlap_score < 0.12:
+            continue
+
+        ranked_pairs.append((overlap_score, research_index, best_ref_index))
+
+    ranked_pairs.sort(key=lambda item: item[0], reverse=True)
+
+    selected_reference_indexes = set(_anchor_chunk_indexes(len(ref_chunks)))
+    selected_research_indexes = set(_anchor_chunk_indexes(len(research_chunks)))
+
+    for _score, research_index, ref_index in ranked_pairs:
+        if len(selected_research_indexes) < EDUREPLICA_CHUNK_SELECTION_LIMIT:
+            selected_research_indexes.add(research_index)
+        if len(selected_reference_indexes) < EDUREPLICA_CHUNK_SELECTION_LIMIT:
+            selected_reference_indexes.add(ref_index)
+
+        if (
+            len(selected_research_indexes) >= EDUREPLICA_CHUNK_SELECTION_LIMIT
+            and len(selected_reference_indexes) >= EDUREPLICA_CHUNK_SELECTION_LIMIT
+        ):
+            break
+
+    reduced_reference_text, used_ref_words = _join_selected_chunks(
+        ref_chunks,
+        selected_reference_indexes,
+        max_words=EDUREPLICA_MAX_WORDS_PER_SIDE,
+    )
+    reduced_research_text, used_research_words = _join_selected_chunks(
+        research_chunks,
+        selected_research_indexes,
+        max_words=EDUREPLICA_MAX_WORDS_PER_SIDE,
+    )
+
+    if not reduced_reference_text or not reduced_research_text:
+        return reference_text, research_text, base_meta
+
+    meta = {
+        "used_chunking": True,
+        "reference_word_count": ref_word_count,
+        "research_word_count": research_word_count,
+        "reference_chunk_count": len(ref_chunks),
+        "research_chunk_count": len(research_chunks),
+        "reference_chunks_used": len(selected_reference_indexes),
+        "research_chunks_used": len(selected_research_indexes),
+        "reference_words_used": used_ref_words,
+        "research_words_used": used_research_words,
+    }
+    return reduced_reference_text, reduced_research_text, meta
+
+
 def show_report():
     global full_text
 
@@ -1060,11 +1268,21 @@ def check_research():
             )
             return
 
-        set_loading_phase("Checking against sources")
+        set_loading_phase("Preparing comparison strategy")
+        compare_reference_text, compare_research_text, compare_meta = _prepare_edureplica_comparison_texts(
+            reference_text,
+            research_text,
+        )
+
+        if compare_meta.get("used_chunking"):
+            set_loading_phase("Long document mode: comparing selected chunks")
+        else:
+            set_loading_phase("Checking against sources")
+
         similarity = float(
             compare_texts(
-                reference_text,
-                research_text,
+                compare_reference_text,
+                compare_research_text,
                 progress_callback=set_loading_phase,
             )
         )
@@ -1113,6 +1331,26 @@ def check_research():
         justify="left",
     )
     detail_label.pack(pady=(0, 10), padx=20, anchor="w")
+
+    if compare_meta.get("used_chunking"):
+        chunk_note = Label(
+            research_result_frame,
+            text=(
+                "Long document mode was used for speed: "
+                f"reference chunks {compare_meta.get('reference_chunks_used', 0)}/"
+                f"{compare_meta.get('reference_chunk_count', 0)}, "
+                f"research chunks {compare_meta.get('research_chunks_used', 0)}/"
+                f"{compare_meta.get('research_chunk_count', 0)} "
+                f"(words compared: {compare_meta.get('reference_words_used', 0)} + "
+                f"{compare_meta.get('research_words_used', 0)})."
+            ),
+            fg=ACCENT,
+            bg=BG_SURFACE,
+            font=("Arial", 10),
+            wraplength=820,
+            justify="left",
+        )
+        chunk_note.pack(pady=(0, 10), padx=20, anchor="w")
 
     research_result_frame.pack(fill=BOTH, expand=True)
 
@@ -1605,7 +1843,8 @@ research_hint = Label(
     research_page,
     text=(
         "Compare two local files directly. Reference File is the source to compare against, "
-        "and Research Paper is your draft."
+        "and Research Paper is your draft. Long documents are automatically optimized using "
+        "chunk selection for faster checks."
     ),
     font=("Arial", 11),
     fg=TEXT_MUTED,
