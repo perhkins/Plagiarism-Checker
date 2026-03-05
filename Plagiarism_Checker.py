@@ -367,13 +367,16 @@ def import_references():
         messagebox.showwarning("Missing Input", query_note)
         return
 
-    start_loading("Fetching references")
+    start_loading("Searching multiple sources")
 
     try:
         if query.lower().startswith(("http://", "https://")):
             reference, status = fetch_reference_from_url(query, timeout=8)
             api_references = [reference] if reference else []
         else:
+            # Update message to reflect comprehensive search
+            progress_label.config(text="Searching academic and web sources...")
+            root.update_idletasks()
             api_references, status = fetch_reference_texts(
                 query,
                 max_results=REFERENCE_FETCH_LIMIT,
@@ -467,9 +470,15 @@ def request_review(text):
         query, query_note = get_effective_reference_query(text)
         if query:
             if query.lower().startswith(("http://", "https://")):
+                # Update loading message for URL fetch
+                progress_label.config(text="Fetching from URL...")
+                root.update_idletasks()
                 reference, status_message = fetch_reference_from_url(query, timeout=8)
                 references = [reference] if reference else []
             else:
+                # Update loading message for reference search
+                progress_label.config(text="Searching references...")
+                root.update_idletasks()
                 references, status_message = fetch_reference_texts(
                     query,
                     max_results=REFERENCE_FETCH_LIMIT,
@@ -484,6 +493,10 @@ def request_review(text):
         elif query_note:
             status_message = query_note
 
+    # Update loading message for analysis phase
+    progress_label.config(text="Analyzing text content...")
+    root.update_idletasks()
+    
     plagiarized_data = analyze_text_against_references(text, references)
     plagiarized_contents = plagiarized_data.get("plagiarized_contents", {})
     data = plagiarized_data.get("data", [0.0, 100.0])

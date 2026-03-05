@@ -1,9 +1,11 @@
 import re
 import math
+import json
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from html import unescape
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote_plus
 
 import requests
 from PyPDF2 import PdfReader
@@ -363,6 +365,133 @@ def _openalex_abstract_from_index(inverted_index: Dict[str, List[int]]) -> str:
   return _collapse_whitespace(" ".join(word for word in words if word))
 
 
+def fetch_duckduckgo_results(query: str, max_results: int = 10, timeout: int = 6) -> List[Dict[str, str]]:
+  """Fetch web search results from DuckDuckGo HTML (free, no API key)."""
+  results = []
+  try:
+    encoded_query = quote_plus(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+    response = requests.get(
+      url,
+      timeout=timeout,
+      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+    )
+    response.raise_for_status()
+    
+    html = response.text
+    # Extract search result links and snippets
+    link_pattern = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([^<]+)</a>')
+    snippet_pattern = re.compile(r'<a[^>]+class="result__snippet"[^>]*>([^<]+)</a>')
+    
+    links = link_pattern.findall(html)
+    snippets = snippet_pattern.findall(html)
+    
+    for i, (link, title) in enumerate(links[:max_results]):
+      snippet = snippets[i] if i < len(snippets) else ""
+      snippet_text = _strip_html_text(snippet)
+      
+      if len(snippet_text) < 50:
+        continue
+        
+      results.append({
+        "title": _strip_html_text(title)[:200],
+        "url": link,
+        "text": snippet_text[:1500],
+        "source": "DuckDuckGo",
+      })
+  except Exception:
+    pass
+  
+  return results
+
+
+def fetch_wikipedia_results(query: str, max_results: int = 5, timeout: int = 6) -> List[Dict[str, str]]:
+  """Fetch encyclopedia content from Wikipedia API (free, no API key)."""
+  results = []
+  try:
+    # Search for relevant articles
+    search_url = "https://en.wikipedia.org/w/api.php"
+    search_params = {
+      "action": "opensearch",
+      "search": query,
+      "limit": max_results,
+      "format": "json",
+    }
+    search_response = requests.get(search_url, params=search_params, timeout=timeout)
+    search_response.raise_for_status()
+    search_data = search_response.json()
+    
+    titles = search_data[1] if len(search_data) > 1 else []
+    descriptions = search_data[2] if len(search_data) > 2 else []
+    urls = search_data[3] if len(search_data) > 3 else []
+    
+    # Fetch extracts for each article
+    for i, title in enumerate(titles[:max_results]):
+      extract_params = {
+        "action": "query",
+        "titles": title,
+        "prop": "extracts",
+        "exintro": True,
+        "explaintext": True,
+        "format": "json",
+      }
+      extract_response = requests.get(search_url, params=extract_params, timeout=timeout)
+      extract_response.raise_for_status()
+      extract_data = extract_response.json()
+      
+      pages = extract_data.get("query", {}).get("pages", {})
+      for page in pages.values():
+        extract = page.get("extract", "")
+        if len(extract) >= 100:
+          results.append({
+            "title": title,
+            "url": urls[i] if i < len(urls) else "",
+            "text": extract[:3000],
+            "source": "Wikipedia",
+          })
+          break
+  except Exception:
+    pass
+  
+  return results
+
+
+def fetch_google_custom_search(query: str, api_key: str = "", cx: str = "", max_results: int = 10, timeout: int = 6) -> List[Dict[str, str]]:
+  """Fetch web results from Google Custom Search API (100 free queries/day with API key)."""
+  results = []
+  if not api_key or not cx:
+    return results
+    
+  try:
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+      "key": api_key,
+      "cx": cx,
+      "q": query,
+      "num": min(10, max_results),
+    }
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    
+    for item in data.get("items", [])[:max_results]:
+      title = item.get("title", "")
+      link = item.get("link", "")
+      snippet = item.get("snippet", "")
+      
+      if len(snippet) >= 50:
+        results.append({
+          "title": title[:200],
+          "url": link,
+          "text": snippet[:1500],
+          "source": "Google",
+        })
+  except Exception:
+    pass
+  
+  return results
+
+
 def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[str, str]], str]:
   """Fetch plain text content from a URL as a manual reference source."""
   try:
@@ -409,8 +538,8 @@ def fetch_reference_texts(
   timeout: int = 8,
 ) -> Tuple[List[Dict[str, str]], str]:
   """
-  Fetch free reference abstracts from Crossref and OpenAlex.
-  Returns a list of references and a status message.
+  Fetch references from multiple free sources: academic papers (Crossref, OpenAlex, Semantic Scholar)
+  and web content (DuckDuckGo, Wikipedia). Returns a list of references and a status message.
   """
   cleaned_query = _collapse_whitespace(query)
   if not cleaned_query:
@@ -529,6 +658,21 @@ def fetch_reference_texts(
     except requests.RequestException as exc:
       issues.append(f"Semantic Scholar unavailable ({exc.__class__.__name__})")
 
+  # Add web sources (DuckDuckGo and Wikipedia) for broader coverage beyond academic papers
+  if len(references) < max_results:
+    try:
+      web_results = fetch_duckduckgo_results(cleaned_query, max_results=8, timeout=timeout)
+      references.extend(web_results)
+    except Exception as exc:
+      issues.append(f"DuckDuckGo search failed ({exc.__class__.__name__})")
+
+  if len(references) < max_results:
+    try:
+      wiki_results = fetch_wikipedia_results(cleaned_query, max_results=5, timeout=timeout)
+      references.extend(wiki_results)
+    except Exception as exc:
+      issues.append(f"Wikipedia search failed ({exc.__class__.__name__})")
+
   deduplicated: List[Dict[str, str]] = []
   seen = set()
   for reference in references:
@@ -544,7 +688,7 @@ def fetch_reference_texts(
   deduplicated = deduplicated[:max_results]
 
   if deduplicated:
-    message = f"Loaded {len(deduplicated)} reference abstracts from free APIs."
+    message = f"Loaded {len(deduplicated)} references from academic and web sources."
     if issues:
       message += " Some sources were unavailable, but fallback succeeded."
     return deduplicated, message
@@ -701,6 +845,13 @@ def analyze_text_against_references(
     if not candidate_counter:
       continue
 
+    # Filter to candidates with sufficient overlap (performance optimization)
+    # At least 2 n-gram or 4 concept hits to be worth detailed evaluation
+    viable_candidates = [(idx, hits) for idx, hits in candidate_counter.most_common(35) if hits >= 2]
+    
+    if not viable_candidates:
+      continue
+
     best_score = 0.0
     best_reference: Optional[Dict[str, object]] = None
     sentence_parts: Dict[str, float] = {}
@@ -712,9 +863,14 @@ def analyze_text_against_references(
       target_paragraph = target_paragraphs[target_paragraph_id]
 
     # Evaluate likely candidate sentences; include paragraph-context scoring.
-    for ref_idx, _hits in candidate_counter.most_common(80):
+    # Reduced from 80 to 35 candidates for better performance.
+    for ref_idx, _hits in viable_candidates:
       ref_sentence = reference_sentences[ref_idx]
       sent_score, sent_parts = _span_similarity(sentence, ref_sentence)
+      
+      # Early exit if sentence score is too low to matter
+      if sent_score < (min_score * 0.8):
+        continue
 
       paragraph_score = 0.0
       current_paragraph_parts: Dict[str, float] = {}
