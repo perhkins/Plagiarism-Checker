@@ -2,7 +2,7 @@ import re
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from html import unescape
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 from PyPDF2 import PdfReader
@@ -12,6 +12,21 @@ from docx import Document
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
 SENTENCE_RE = re.compile(r"[^.!?\n]+[.!?]?")
 TAG_RE = re.compile(r"<[^>]+>")
+
+STOPWORDS: Set[str] = {
+  "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+  "any", "are", "as", "at", "be", "because", "been", "before", "being", "below",
+  "between", "both", "but", "by", "can", "could", "did", "do", "does", "doing",
+  "down", "during", "each", "few", "for", "from", "further", "had", "has", "have",
+  "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how",
+  "i", "if", "in", "into", "is", "it", "its", "itself", "just", "me", "more", "most",
+  "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", "only", "or",
+  "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she", "should",
+  "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+  "then", "there", "these", "they", "this", "those", "through", "to", "too", "under",
+  "until", "up", "very", "was", "we", "were", "what", "when", "where", "which", "while",
+  "who", "whom", "why", "with", "would", "you", "your", "yours", "yourself", "yourselves",
+}
 
 
 def process_file(file_path: str) -> str:
@@ -45,6 +60,33 @@ def _normalize_text(text: str) -> str:
 def _tokenize(text: str) -> List[str]:
   normalized = _normalize_text(text)
   return normalized.split() if normalized else []
+
+
+def extract_query_keywords(text: str, top_k: int = 8) -> str:
+  """Extract a concise keyword query from input text for API searching."""
+  tokens = _tokenize(text)
+  filtered = [
+    token for token in tokens
+    if len(token) >= 4 and token not in STOPWORDS and not token.isdigit()
+  ]
+
+  if not filtered:
+    return ""
+
+  counts = Counter(filtered)
+  selected = [word for word, _count in counts.most_common(max(4, top_k))]
+
+  # Keep ordering stable based on first appearance in text.
+  seen = set()
+  ordered = []
+  for token in filtered:
+    if token in selected and token not in seen:
+      seen.add(token)
+      ordered.append(token)
+    if len(ordered) >= top_k:
+      break
+
+  return " ".join(ordered)
 
 
 def _make_ngrams(tokens: Sequence[str], n: int = 3) -> set:
@@ -154,7 +196,7 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
 
 def fetch_reference_texts(
   query: str,
-  max_results: int = 8,
+  max_results: int = 20,
   timeout: int = 8,
 ) -> Tuple[List[Dict[str, str]], str]:
   """
@@ -169,9 +211,10 @@ def fetch_reference_texts(
   issues: List[str] = []
 
   try:
+    crossref_rows = min(80, max(20, max_results * 4))
     crossref_response = requests.get(
       "https://api.crossref.org/works",
-      params={"query.bibliographic": cleaned_query, "rows": max_results},
+      params={"query.bibliographic": cleaned_query, "rows": crossref_rows},
       timeout=timeout,
       headers={
         "User-Agent": "AuthentiText/1.0 (mailto:example@example.com)",
@@ -201,33 +244,81 @@ def fetch_reference_texts(
     issues.append(f"Crossref unavailable ({exc.__class__.__name__})")
 
   # OpenAlex has broader free abstract coverage and works well as fallback.
-  if len(references) < max(2, max_results // 3):
+  if len(references) < max_results:
     try:
-      openalex_response = requests.get(
-        "https://api.openalex.org/works",
-        params={"search": cleaned_query, "per-page": max_results},
-        timeout=timeout,
-      )
-      openalex_response.raise_for_status()
-      results = openalex_response.json().get("results", [])
+      per_page = min(50, max(20, max_results))
+      for page in range(1, 4):
+        if len(references) >= max_results * 2:
+          break
 
-      for item in results:
-        abstract = _openalex_abstract_from_index(
-          item.get("abstract_inverted_index") or {}
+        openalex_response = requests.get(
+          "https://api.openalex.org/works",
+          params={"search": cleaned_query, "per-page": per_page, "page": page},
+          timeout=timeout,
         )
-        if not abstract:
+        openalex_response.raise_for_status()
+        results = openalex_response.json().get("results", [])
+
+        for item in results:
+          abstract = _openalex_abstract_from_index(
+            item.get("abstract_inverted_index") or {}
+          )
+          if not abstract:
+            continue
+
+          references.append(
+            {
+              "title": _collapse_whitespace(item.get("display_name", "Untitled")),
+              "url": item.get("id", ""),
+              "text": abstract,
+              "source": "OpenAlex",
+            }
+          )
+
+        if not results:
+          break
+    except requests.RequestException as exc:
+      issues.append(f"OpenAlex unavailable ({exc.__class__.__name__})")
+
+  # Semantic Scholar often returns abstracts for broad topics and has free unauthenticated access.
+  if len(references) < max_results:
+    try:
+      ss_limit = min(50, max(20, max_results * 2))
+      ss_response = requests.get(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        params={
+          "query": cleaned_query,
+          "limit": ss_limit,
+          "fields": "title,abstract,url,externalIds",
+        },
+        timeout=timeout,
+        headers={"User-Agent": "AuthentiText/1.0"},
+      )
+      ss_response.raise_for_status()
+      papers = ss_response.json().get("data", [])
+
+      for paper in papers:
+        abstract = _collapse_whitespace(paper.get("abstract", ""))
+        if len(abstract) < 80:
           continue
+
+        title = _collapse_whitespace(paper.get("title", "Untitled"))
+        url = _collapse_whitespace(paper.get("url", ""))
+        if not url:
+          doi = (paper.get("externalIds") or {}).get("DOI")
+          if doi:
+            url = f"https://doi.org/{doi}"
 
         references.append(
           {
-            "title": _collapse_whitespace(item.get("display_name", "Untitled")),
-            "url": item.get("id", ""),
+            "title": title,
+            "url": url,
             "text": abstract,
-            "source": "OpenAlex",
+            "source": "Semantic Scholar",
           }
         )
     except requests.RequestException as exc:
-      issues.append(f"OpenAlex unavailable ({exc.__class__.__name__})")
+      issues.append(f"Semantic Scholar unavailable ({exc.__class__.__name__})")
 
   deduplicated: List[Dict[str, str]] = []
   seen = set()
@@ -240,6 +331,8 @@ def fetch_reference_texts(
       continue
     seen.add(key)
     deduplicated.append(reference)
+
+  deduplicated = deduplicated[:max_results]
 
   if deduplicated:
     message = f"Loaded {len(deduplicated)} reference abstracts from free APIs."
@@ -435,8 +528,8 @@ def check_against_reference_text(ref_file: str, text_file: str) -> float:
         "source": "Local File",
       }
     ],
-    min_score=0.78,
-    max_matches=20,
+    min_score=0.74,
+    max_matches=28,
   )
   return float(result.get("data", [0.0, 100.0])[0])
 

@@ -1,5 +1,4 @@
 import os
-import time
 import webbrowser
 from pathlib import Path
 from tkinter import (
@@ -45,6 +44,7 @@ except ImportError:
 from plag_algo import (
     analyze_text_against_references,
     check_against_reference_text as cart,
+    extract_query_keywords,
     fetch_reference_from_url,
     fetch_reference_texts,
     process_file,
@@ -86,22 +86,79 @@ DANGER = "#ef4444"
 BUTTON_PRIMARY = "#2563eb"
 BUTTON_SUCCESS = "#15803d"
 BUTTON_DANGER = "#b91c1c"
+REFERENCE_FETCH_LIMIT = 24
+DETAILS_COLLAPSED_PREVIEW = 170
 
 
-def simulate_progress(progress_bar, label, label_text, duration=0.5):
-    """Show quick progress feedback without adding large delays."""
-    steps = 20
-    for step in range(steps + 1):
-        percent = int((step / steps) * 100)
-        progress_bar["value"] = percent
-        label.config(text=f"{label_text}: {percent}%")
-        progress_bar.update_idletasks()
-        if duration > 0:
-            time.sleep(duration / steps)
+loading_message = ""
+loading_phase = 0
+loading_after_id = None
 
 
 def set_feedback(message, color=TEXT_MUTED):
     feedback_label.config(text=message, fg=color)
+
+
+def _animate_loading_label():
+    global loading_after_id, loading_phase
+
+    dots = "." * ((loading_phase % 3) + 1)
+    progress_label.config(text=f"{loading_message}{dots}")
+    loading_phase += 1
+    loading_after_id = progress_label.after(280, _animate_loading_label)
+
+
+def start_loading(message):
+    global loading_message, loading_phase
+
+    loading_message = message
+    loading_phase = 0
+    progress_label.config(text=message)
+    progress_label.pack(padx=40)
+
+    progress_bar.config(mode="indeterminate")
+    progress_bar.pack(padx=40, pady=5)
+    progress_bar.start(12)
+    _animate_loading_label()
+
+    # Ensure the loading state is painted before blocking work starts.
+    root.update_idletasks()
+
+
+def stop_loading():
+    global loading_after_id
+
+    if loading_after_id:
+        try:
+            progress_label.after_cancel(loading_after_id)
+        except Exception:
+            pass
+        loading_after_id = None
+
+    progress_bar.stop()
+    progress_bar.config(mode="determinate", value=0)
+    progress_label.pack_forget()
+    progress_bar.pack_forget()
+
+
+def reset_review_output(clear_message=""):
+    global plagiarized_data, plagiarized_contents, data
+
+    plagiarized_data = {
+        "plagiarized_contents": {},
+        "data": [0.0, 100.0],
+        "mode": "empty",
+        "note": "",
+    }
+    plagiarized_contents = plagiarized_data["plagiarized_contents"]
+    data = plagiarized_data["data"]
+
+    for widget in report_frame.winfo_children():
+        widget.destroy()
+    report_frame.pack_forget()
+
+    if clear_message:
+        set_feedback(clear_message, TEXT_MUTED)
 
 
 def safe_load_image(file_name, size):
@@ -270,14 +327,11 @@ def file_upload():
     if not file_path:
         return ""
 
-    progress_label.pack(padx=40)
-    progress_bar.pack(padx=40, pady=5)
-    simulate_progress(progress_bar, progress_label, "Uploading file", duration=0.4)
+    start_loading("Uploading file")
 
     content = process_file(file_path)
 
-    progress_label.pack_forget()
-    progress_bar.pack_forget()
+    stop_loading()
 
     if not content:
         messagebox.showwarning("Error", "Unsupported file type or empty content.")
@@ -286,29 +340,50 @@ def file_upload():
     text_box.delete("1.0", END)
     text_box.insert(END, content)
     uploaded_file_label.config(text=f"Loaded file: {Path(file_path).name}", fg=ACCENT)
+    reset_review_output("Loaded a new file. Previous plagiarism report was cleared.")
     return file_path
+
+
+def get_effective_reference_query(source_text):
+    raw_query = reference_query_entry.get().strip()
+    if raw_query:
+        return raw_query, ""
+
+    auto_query = extract_query_keywords(source_text, top_k=10)
+    if auto_query:
+        reference_query_entry.delete(0, END)
+        reference_query_entry.insert(END, auto_query)
+        return auto_query, f"No query entered. Auto-generated keywords: '{auto_query}'."
+
+    return "", "Enter a topic/DOI/URL or add richer text for keyword extraction."
 
 
 def import_references():
     global api_references
 
-    query = reference_query_entry.get().strip()
+    source_text = text_box.get("1.0", END).strip()
+    query, query_note = get_effective_reference_query(source_text)
     if not query:
-        messagebox.showwarning("Missing Input", "Enter a topic, DOI, title, or URL first.")
+        messagebox.showwarning("Missing Input", query_note)
         return
 
-    progress_label.pack(padx=40)
-    progress_bar.pack(padx=40, pady=5)
-    simulate_progress(progress_bar, progress_label, "Loading references", duration=0.4)
+    start_loading("Fetching references")
 
-    if query.lower().startswith(("http://", "https://")):
-        reference, status = fetch_reference_from_url(query, timeout=8)
-        api_references = [reference] if reference else []
-    else:
-        api_references, status = fetch_reference_texts(query, max_results=8, timeout=8)
+    try:
+        if query.lower().startswith(("http://", "https://")):
+            reference, status = fetch_reference_from_url(query, timeout=8)
+            api_references = [reference] if reference else []
+        else:
+            api_references, status = fetch_reference_texts(
+                query,
+                max_results=REFERENCE_FETCH_LIMIT,
+                timeout=8,
+            )
+    finally:
+        stop_loading()
 
-    progress_label.pack_forget()
-    progress_bar.pack_forget()
+    if query_note and query_note not in status:
+        status = f"{query_note} {status}".strip()
 
     if api_references:
         set_feedback(status, SUCCESS)
@@ -341,13 +416,13 @@ def preview_loaded_references():
         return
 
     preview_lines = []
-    for index, reference in enumerate(api_references[:12], start=1):
+    for index, reference in enumerate(api_references[:18], start=1):
         title = (reference.get("title") or "Untitled Source").strip()
         source_name = (reference.get("source") or "API").strip()
         preview_lines.append(f"{index}. {title} [{source_name}]")
 
-    if len(api_references) > 12:
-        preview_lines.append(f"...and {len(api_references) - 12} more references.")
+    if len(api_references) > 18:
+        preview_lines.append(f"...and {len(api_references) - 18} more references.")
 
     messagebox.showinfo("Loaded References", "\n".join(preview_lines))
 
@@ -363,6 +438,25 @@ def clear_loaded_references():
     )
 
 
+def quick_suggestion(match_type):
+    if match_type == "Exact Match":
+        return "Quote and cite this source directly, or rewrite this passage from scratch in your own voice."
+    if match_type == "Near Match":
+        return "Restructure sentence flow and add citation where the idea originates from the source."
+    if match_type == "Paraphrased Overlap":
+        return "Keep the idea but vary argument structure and vocabulary, then cite the original source."
+    return "Review this sentence and add citation or deeper rewrite to reduce similarity risk."
+
+
+def toggle_match_details(details_frame, toggle_button):
+    if details_frame.winfo_manager():
+        details_frame.pack_forget()
+        toggle_button.config(text="Show Details")
+    else:
+        details_frame.pack(fill=X, padx=12, pady=(6, 10))
+        toggle_button.config(text="Hide Details")
+
+
 def request_review(text):
     global plagiarized_data, plagiarized_contents, data, api_references
 
@@ -370,7 +464,7 @@ def request_review(text):
     status_message = ""
 
     if not references:
-        query = reference_query_entry.get().strip()
+        query, query_note = get_effective_reference_query(text)
         if query:
             if query.lower().startswith(("http://", "https://")):
                 reference, status_message = fetch_reference_from_url(query, timeout=8)
@@ -378,11 +472,17 @@ def request_review(text):
             else:
                 references, status_message = fetch_reference_texts(
                     query,
-                    max_results=8,
+                    max_results=REFERENCE_FETCH_LIMIT,
                     timeout=8,
                 )
+
+            if query_note:
+                status_message = f"{query_note} {status_message}".strip()
+
             if references:
                 api_references = references
+        elif query_note:
+            status_message = query_note
 
     plagiarized_data = analyze_text_against_references(text, references)
     plagiarized_contents = plagiarized_data.get("plagiarized_contents", {})
@@ -423,12 +523,11 @@ def show_report():
     for widget in report_frame.winfo_children():
         widget.destroy()
 
-    progress_label.pack(padx=40)
-    progress_bar.pack(padx=40, pady=5)
-    simulate_progress(progress_bar, progress_label, "Processing Text", duration=0.5)
-    request_review(selected_text)
-    progress_label.pack_forget()
-    progress_bar.pack_forget()
+    start_loading("Analyzing text")
+    try:
+        request_review(selected_text)
+    finally:
+        stop_loading()
 
     text_box.config(state="normal")
     report_frame.pack(fill=BOTH, expand=True)
@@ -467,32 +566,30 @@ def show_report():
 
     plagiarized_label = Label(
         report_frame,
-        text="Plagiarized Content Review",
+        text="Plagiarized Content Review (Compact Cards)",
         bg=BG_SURFACE,
         fg=DANGER,
         font=("Helvetica", 14),
     )
     plagiarized_label.pack(anchor="nw", padx=40, pady=10)
 
-    plagiarized_text = Text(
-        report_frame,
-        fg=TEXT_MAIN,
-        bg=BG_SURFACE,
-        font=("Helvetica", 13),
-        height=20,
-        highlightthickness=2,
-        highlightbackground=DANGER,
-        highlightcolor=ACCENT,
-        relief="flat",
-    )
-    plagiarized_text.pack(padx=10, pady=10, expand=True)
+    matches_container = Frame(report_frame, bg=BG_SURFACE)
+    matches_container.pack(fill=X, padx=20, pady=(0, 12), expand=True)
 
     if not plagiarized_contents:
-        plagiarized_text.insert(
-            END,
-            "No strong overlaps detected from loaded sources. "
-            "You can import references with a topic/DOI/URL for stronger checks.\n",
+        no_overlap = Label(
+            matches_container,
+            text=(
+                "No strong overlaps detected from loaded sources. "
+                "You can fetch references with a topic/DOI/URL for stronger checks."
+            ),
+            fg=TEXT_MUTED,
+            bg=BG_SURFACE,
+            font=("Arial", 11),
+            wraplength=860,
+            justify="left",
         )
+        no_overlap.pack(anchor="w", padx=12, pady=(4, 8))
     else:
         for index, key in enumerate(plagiarized_contents, start=1):
             item = plagiarized_contents[key]
@@ -501,44 +598,109 @@ def show_report():
             source_title, source_url = item.get("source", ("Unknown Source", ""))
             score = float(item.get("score", 0.0))
 
-            plagiarized_text.insert(END, f"{index}. {paragraph}\n", "paragraph")
-            plagiarized_text.insert(
-                END,
-                f"Match Type: {match_type} ({score:.1f}%)\n",
-                "match_type",
+            card = Frame(
+                matches_container,
+                bg=BG_MAIN,
+                highlightthickness=1,
+                highlightbackground=BG_HEADER,
+            )
+            card.pack(fill=X, padx=8, pady=6)
+
+            header_row = Frame(card, bg=BG_MAIN)
+            header_row.pack(fill=X, padx=12, pady=(10, 4))
+
+            snippet = paragraph
+            if len(snippet) > DETAILS_COLLAPSED_PREVIEW:
+                snippet = snippet[: DETAILS_COLLAPSED_PREVIEW - 3].rstrip() + "..."
+
+            title_label = Label(
+                header_row,
+                text=f"{index}. {snippet}",
+                fg=TEXT_MAIN,
+                bg=BG_MAIN,
+                font=("Arial", 11, "bold"),
+                justify="left",
+                anchor="w",
+                wraplength=700,
+            )
+            title_label.pack(side=LEFT, fill=X, expand=True)
+
+            toggle_button = Button(
+                header_row,
+                text="Show Details",
+                bg=BUTTON_PRIMARY,
+                fg=TEXT_MAIN,
+                borderwidth=0,
+                relief="flat",
+                font=("Arial", 9, "bold"),
+                padx=8,
+                pady=4,
+            )
+            toggle_button.pack(side=RIGHT, padx=(12, 0))
+
+            meta = Label(
+                card,
+                text=f"{match_type} | Score: {score:.1f}%",
+                fg=ACCENT,
+                bg=BG_MAIN,
+                font=("Arial", 10, "bold"),
+            )
+            meta.pack(anchor="w", padx=12, pady=(0, 4))
+
+            details_frame = Frame(card, bg=BG_MAIN)
+
+            source_label = Label(
+                details_frame,
+                text=f"Source: {source_title}",
+                fg=ACCENT,
+                bg=BG_MAIN,
+                font=("Arial", 10, "underline") if source_url else ("Arial", 10),
+                cursor="hand2" if source_url else "arrow",
+                wraplength=820,
+                justify="left",
+                anchor="w",
+            )
+            source_label.pack(anchor="w", pady=(0, 6))
+            if source_url:
+                source_label.bind("<Button-1>", lambda event, link=source_url: open_link(event, link))
+
+            full_text_label = Label(
+                details_frame,
+                text=f"Passage: {paragraph}",
+                fg=TEXT_MUTED,
+                bg=BG_MAIN,
+                font=("Arial", 10),
+                wraplength=820,
+                justify="left",
+                anchor="w",
+            )
+            full_text_label.pack(anchor="w", pady=(0, 6))
+
+            # Keep feedback fast by using AI suggestions only on top matches.
+            if client and index <= 2:
+                suggestion = suggest_improvement(paragraph)
+            else:
+                suggestion = quick_suggestion(match_type)
+
+            suggestion_label = Label(
+                details_frame,
+                text=f"Suggestion: {suggestion}",
+                fg=SUCCESS,
+                bg=BG_MAIN,
+                font=("Arial", 10),
+                wraplength=820,
+                justify="left",
+                anchor="w",
+            )
+            suggestion_label.pack(anchor="w")
+
+            toggle_button.config(
+                command=lambda frame=details_frame, btn=toggle_button: toggle_match_details(frame, btn)
             )
 
-            start_index = plagiarized_text.index(END)
-            plagiarized_text.insert(END, f"Source: {source_title}\n")
-            end_index = plagiarized_text.index(END)
-
-            source_tag = f"source_{index}"
-            plagiarized_text.tag_add(source_tag, start_index, end_index)
-            plagiarized_text.tag_configure(source_tag, foreground=ACCENT, underline=True)
-            if source_url:
-                plagiarized_text.tag_bind(
-                    source_tag,
-                    "<Button-1>",
-                    lambda event, link=source_url: open_link(event, link),
-                )
-
-            suggestion = suggest_improvement(paragraph)
-            plagiarized_text.insert(END, f"Suggestion: {suggestion}\n\n", "suggestion")
-
-    plagiarized_text.tag_configure("paragraph", foreground="#ff7675", font=("Helvetica", 13, "bold"))
-    plagiarized_text.tag_configure(
-        "match_type",
-        foreground="white",
-        background="#c0392b",
-        font=("Arial", 11, "italic"),
-    )
-    plagiarized_text.tag_configure(
-        "suggestion",
-        foreground="white",
-        background="#1e8449",
-        font=("Arial", 11),
-    )
-    plagiarized_text.config(state="disabled")
+            if index <= 2:
+                details_frame.pack(fill=X, padx=12, pady=(6, 10))
+                toggle_button.config(text="Hide Details")
 
     tones = ["Professional", "Creative", "Formal", "Innovative"]
     tone_label = Label(
@@ -678,20 +840,24 @@ def check_research():
         messagebox.showwarning("Missing Files", "Please add both reference and research files.")
         return
 
-    progress_label.pack(padx=40)
-    progress_bar.pack(padx=40, pady=5)
-    simulate_progress(progress_bar, progress_label, "Comparing files", duration=0.4)
+    reference_text = process_file(ref_file)
+    research_text = process_file(text_file)
+    if not reference_text or not research_text:
+        messagebox.showwarning(
+            "Unreadable File",
+            "One or both selected files are empty or unsupported. Use .txt, .docx, or .pdf files.",
+        )
+        return
+
+    start_loading("Comparing files")
 
     try:
         similarity = float(cart(ref_file, text_file))
     except Exception as exc:
-        progress_label.pack_forget()
-        progress_bar.pack_forget()
         messagebox.showerror("Comparison Error", str(exc))
         return
-
-    progress_label.pack_forget()
-    progress_bar.pack_forget()
+    finally:
+        stop_loading()
 
     percent_plagiarized = max(0.0, min(100.0, similarity))
     percent_original = 100.0 - percent_plagiarized
@@ -710,8 +876,28 @@ def check_research():
 
     render_donut_chart(research_result_frame, [percent_plagiarized, percent_original])
 
-    text_label.config(text=f"Similarity: {percent_plagiarized:.1f}%")
-    text_label.pack(pady=10, padx=20, expand=True)
+    similarity_label = Label(
+        research_result_frame,
+        text=f"Similarity: {percent_plagiarized:.1f}%",
+        fg=TEXT_MAIN,
+        bg=BG_SURFACE,
+        font=("Helvetica", 16, "bold"),
+    )
+    similarity_label.pack(pady=10, padx=20, anchor="w")
+
+    detail_label = Label(
+        research_result_frame,
+        text=(
+            f"Originality estimate: {percent_original:.1f}% | "
+            "Based on sentence-level overlap against the selected reference file."
+        ),
+        fg=TEXT_MUTED,
+        bg=BG_SURFACE,
+        font=("Arial", 10),
+        wraplength=820,
+        justify="left",
+    )
+    detail_label.pack(pady=(0, 10), padx=20, anchor="w")
 
     research_result_frame.pack(fill=BOTH, expand=True)
 
@@ -915,6 +1101,7 @@ review_help = Label(
         "How KlarityCheck works:\n"
         "1) Paste text or upload a file.\n"
         "2) Optional: Fetch references using Topic, DOI, Title, or URL.\n"
+        "   If left blank, keywords are auto-extracted from your text.\n"
         "3) Click 'Check Plagiarism'. If internet is down, internal overlap check still runs.\n\n"
         "Examples: 'climate change adaptation' | '10.1038/s41586-020-2649-2' | "
         "'https://example.com/article'"
@@ -1271,13 +1458,6 @@ cart_button = Button(
 cart_button.pack(anchor="w", padx=30, pady=(0, 12))
 
 research_result_frame = Frame(research_page, bg=BG_SURFACE)
-text_label = Label(
-    research_result_frame,
-    text="",
-    fg=TEXT_MAIN,
-    bg=BG_SURFACE,
-    font=("Helvetica", 18, "bold"),
-)
 
 if not OPENAI_API_KEY:
     set_feedback(
