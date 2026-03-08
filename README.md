@@ -69,6 +69,8 @@ Web provider sequence is ordered and explicit:
 
 If a provider returns low-overlap references, the pipeline continues to the next provider before committing results.
 
+When query is blank, KlarityCheck uses the pasted/uploaded text as the search seed, gathers a deeper web candidate pool, and reranks sources by overlap before final comparison.
+
 #### Source Expansion
 
 For top web references, the app expands beyond snippets:

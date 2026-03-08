@@ -780,6 +780,98 @@ def toggle_match_details(details_frame, toggle_button):
         toggle_button.config(text="Hide Details")
 
 
+def _merge_highlight_ranges(ranges, text_length):
+    normalized = []
+    for item in ranges or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            start = max(0, min(int(item[0]), text_length))
+            end = max(0, min(int(item[1]), text_length))
+        except Exception:
+            continue
+        if end > start:
+            normalized.append((start, end))
+
+    if not normalized:
+        return []
+
+    normalized.sort(key=lambda value: (value[0], value[1]))
+    merged = [list(normalized[0])]
+    for start, end in normalized[1:]:
+        current = merged[-1]
+        if start <= current[1]:
+            current[1] = max(current[1], end)
+        else:
+            merged.append([start, end])
+
+    return [(start, end) for start, end in merged]
+
+
+def _render_highlighted_paragraph(parent, title, text, highlight_ranges, fg_color=TEXT_MUTED):
+    heading = Label(
+        parent,
+        text=title,
+        fg=ACCENT,
+        bg=BG_MAIN,
+        font=("Arial", 10, "bold"),
+        justify="left",
+        anchor="w",
+    )
+    heading.pack(anchor="w", pady=(0, 4))
+
+    paragraph_text = (text or "").strip()
+    line_estimate = max(4, min(16, (len(paragraph_text) // 105) + 2))
+    text_widget = Text(
+        parent,
+        height=line_estimate,
+        wrap="word",
+        bg=BG_SURFACE,
+        fg=fg_color,
+        insertbackground=TEXT_MAIN,
+        relief="flat",
+        borderwidth=0,
+        font=("Arial", 10),
+        padx=8,
+        pady=6,
+    )
+    text_widget.pack(fill=X, pady=(0, 8))
+    text_widget.insert("1.0", paragraph_text)
+
+    merged_ranges = _merge_highlight_ranges(highlight_ranges, len(paragraph_text))
+    if merged_ranges:
+        text_widget.tag_configure("plag_overlap", background="#7f1d1d", foreground="#fee2e2")
+        for start, end in merged_ranges:
+            text_widget.tag_add(
+                "plag_overlap",
+                f"1.0 + {start} chars",
+                f"1.0 + {end} chars",
+            )
+
+    text_widget.config(state="disabled")
+
+
+def _highlight_input_text(plagiarized_matches):
+    if "text_box" not in globals():
+        return
+
+    try:
+        text_box.tag_remove("plag_match", "1.0", END)
+        text_box.tag_configure("plag_match", background="#7f1d1d", foreground="#fee2e2")
+    except Exception:
+        return
+
+    for item in (plagiarized_matches or {}).values():
+        ranges = item.get("absolute_ranges") or []
+        merged_ranges = _merge_highlight_ranges(ranges, len(full_text))
+        for start, end in merged_ranges:
+            text_box.tag_add(
+                "plag_match",
+                f"1.0 + {start} chars",
+                f"1.0 + {end} chars",
+            )
+
+
 def request_review(text, search_text=""):
     global plagiarized_data, plagiarized_contents, data, api_references
     global reference_cache_mode, reference_cache_query, reference_cache_source_key
@@ -828,6 +920,8 @@ def request_review(text, search_text=""):
     plagiarized_data = analyze_text_against_references(
         text,
         references,
+        min_score=0.58,
+        max_matches=0,
         progress_callback=set_loading_phase,
     )
     plagiarized_contents = plagiarized_data.get("plagiarized_contents", {})
@@ -1083,18 +1177,19 @@ def show_report():
     set_loading_anchor(plag_check_button)
 
     full_text = text_box.get("1.0", END).strip()
-    selected_text, sampled_long_text = _build_analysis_text(full_text, max_words=2400)
 
     if not full_text or full_text == "Kindly enter a text to check for plagiarism.":
         text_box.delete("1.0", END)
         text_box.insert(END, "Kindly enter a text to check for plagiarism.\n")
         return
 
-    if sampled_long_text:
+    if len(full_text.split()) > 4500:
         set_feedback(
-            "Large document detected. Analyzing distributed segments across the file for better accuracy.",
+            "Large document detected. Running full paragraph-first comparison with indexed matching for accuracy and speed.",
             TEXT_MUTED,
         )
+
+    text_box.tag_remove("plag_match", "1.0", END)
 
     text_box.config(state="disabled")
     for widget in report_frame.winfo_children():
@@ -1102,11 +1197,12 @@ def show_report():
 
     start_loading("Analyzing text")
     try:
-        request_review(selected_text, search_text=full_text)
+        request_review(full_text, search_text=full_text)
     finally:
         stop_loading()
 
     text_box.config(state="normal")
+    _highlight_input_text(plagiarized_contents)
     report_frame.pack(fill=BOTH, expand=True)
 
     chart_label = Label(
@@ -1174,6 +1270,8 @@ def show_report():
             match_type = item.get("match_type", "Potential Match")
             source_title, source_url = item.get("source", ("Unknown Source", ""))
             score = float(item.get("score", 0.0))
+            paragraph_coverage = float(item.get("coverage_ratio", 0.0))
+            source_relevance = float(item.get("source_relevance", 0.0))
 
             card = Frame(
                 matches_container,
@@ -1217,7 +1315,11 @@ def show_report():
 
             meta = Label(
                 card,
-                text=f"{match_type} | Score: {score:.1f}%",
+                text=(
+                    f"{match_type} | Score: {score:.1f}% | "
+                    f"Paragraph Coverage: {paragraph_coverage:.1f}% | "
+                    f"Source Relevance: {source_relevance:.1f}%"
+                ),
                 fg=ACCENT,
                 bg=BG_MAIN,
                 font=("Arial", 10, "bold"),
@@ -1241,17 +1343,23 @@ def show_report():
             if source_url:
                 source_label.bind("<Button-1>", lambda event, link=source_url: open_link(event, link))
 
-            full_text_label = Label(
+            _render_highlighted_paragraph(
                 details_frame,
-                text=f"Passage: {paragraph}",
-                fg=TEXT_MUTED,
-                bg=BG_MAIN,
-                font=("Arial", 10),
-                wraplength=820,
-                justify="left",
-                anchor="w",
+                "Passage (highlighted overlap):",
+                paragraph,
+                item.get("highlight_ranges", []),
+                fg_color=TEXT_MUTED,
             )
-            full_text_label.pack(anchor="w", pady=(0, 6))
+
+            source_excerpt = (item.get("source_excerpt", "") or "").strip()
+            if source_excerpt:
+                _render_highlighted_paragraph(
+                    details_frame,
+                    "Matched Source Excerpt:",
+                    source_excerpt,
+                    [],
+                    fg_color=ACCENT,
+                )
 
             # Keep feedback fast by using AI suggestions only on top matches.
             if client and index <= 2:

@@ -230,6 +230,55 @@ def _span_similarity(left: Dict[str, object], right: Dict[str, object]) -> Tuple
 
 
 def _paragraph_spans(text: str, min_words: int = 12) -> List[Dict[str, object]]:
+  def _build_span(raw_text: str, start_pos: int, end_pos: int) -> Optional[Dict[str, object]]:
+    collapsed = _collapse_whitespace(raw_text)
+    if not collapsed:
+      return None
+
+    tokens = _tokenize(collapsed)
+    if len(tokens) < min_words:
+      return None
+
+    normalized = " ".join(tokens)
+    span = {
+      "raw": collapsed,
+      "norm": normalized,
+      "tokens": tokens,
+      "start": start_pos,
+      "end": end_pos,
+    }
+    span.update(_build_span_features(tokens, normalized))
+    return span
+
+  def _split_large_block(raw_block: str, block_start: int) -> List[Dict[str, object]]:
+    sentence_matches = [match for match in SENTENCE_RE.finditer(raw_block or "") if _collapse_whitespace(match.group())]
+    if len(sentence_matches) < 3:
+      return []
+
+    windows: List[Dict[str, object]] = []
+    window_size = 4
+    stride = 2
+    for index in range(0, len(sentence_matches), stride):
+      last = min(len(sentence_matches), index + window_size)
+      if last <= index:
+        continue
+
+      start_match = sentence_matches[index]
+      end_match = sentence_matches[last - 1]
+      raw_chunk = raw_block[start_match.start() : end_match.end()]
+      span = _build_span(raw_chunk, block_start + start_match.start(), block_start + end_match.end())
+      if not span:
+        continue
+
+      windows.append(span)
+      if len(windows) >= 180:
+        break
+
+      if last >= len(sentence_matches):
+        break
+
+    return windows
+
   paragraphs: List[Dict[str, object]] = []
   for match in PARAGRAPH_RE.finditer(text or ""):
     raw = _collapse_whitespace(match.group())
@@ -239,6 +288,14 @@ def _paragraph_spans(text: str, min_words: int = 12) -> List[Dict[str, object]]:
     tokens = _tokenize(raw)
     if len(tokens) < min_words:
       continue
+
+    # Large pages often collapse into one giant paragraph; split them into
+    # sentence windows so local copied sections still match strongly.
+    if len(tokens) > 170:
+      split_spans = _split_large_block(match.group(), match.start())
+      if split_spans:
+        paragraphs.extend(split_spans)
+        continue
 
     normalized = " ".join(tokens)
     paragraph = {
@@ -408,6 +465,28 @@ def _build_paragraph_search_queries(
 
   selected_queries: List[str] = []
   seen = set()
+
+  # Preserve one exact phrase query so search providers can recover the original page.
+  exact_phrase_query = ""
+  if source_text:
+    for match in PARAGRAPH_RE.finditer(source_text):
+      raw_paragraph = _collapse_whitespace(match.group())
+      if not raw_paragraph:
+        continue
+
+      tokens = _tokenize(raw_paragraph)
+      if len(tokens) < 14:
+        continue
+
+      exact_phrase_query = '"' + " ".join(tokens[:18]) + '"'
+      break
+
+  if exact_phrase_query:
+    normalized_exact = _normalize_text(exact_phrase_query)
+    if normalized_exact and normalized_exact not in seen:
+      seen.add(normalized_exact)
+      selected_queries.append(exact_phrase_query)
+
   for _focus, _list_penalty, _diversity, _token_count, _index, candidate in sorted(
     paragraph_candidates,
     key=lambda value: (-value[0], value[1], -value[2], -value[3], value[4]),
@@ -511,6 +590,167 @@ def _compact_issue_summary(issues: Sequence[str], max_items: int = 3) -> str:
   return "; ".join(ordered_unique[:max_items]) + "; ..."
 
 
+def _build_source_overlap_profile(source_text: str) -> Dict[str, object]:
+  cleaned_source = _repair_character_spaced_text(
+    _normalize_extracted_text(source_text or "")
+  ).strip()
+  if len(cleaned_source) > 48000:
+    cleaned_source = _distributed_text_sample(cleaned_source, max_chars=42000)
+
+  normalized_source = _normalize_text(cleaned_source)
+  source_tokens = normalized_source.split()
+  source_terms = set(_content_tokens(source_tokens[:2600]))
+  source_sample = normalized_source[:3200]
+  source_chargrams = _char_ngrams(source_sample, n=4)
+
+  first_line = _collapse_whitespace((cleaned_source.splitlines() or [""])[0])
+  headline_tokens = _tokenize(first_line)[:16]
+  headline_norm = " ".join(headline_tokens)
+
+  probe_phrases: List[str] = []
+  seen_phrases = set()
+  probe_spans = _paragraph_spans(cleaned_source, min_words=8)
+  if not probe_spans:
+    probe_spans = _sentence_spans(cleaned_source, min_words=8)
+
+  if probe_spans:
+    preferred_indexes = [
+      0,
+      len(probe_spans) // 3,
+      (len(probe_spans) * 2) // 3,
+      len(probe_spans) - 1,
+    ]
+    for index in preferred_indexes:
+      if not (0 <= index < len(probe_spans)):
+        continue
+
+      span_tokens = list(probe_spans[index].get("tokens", []))
+      if len(span_tokens) < 10:
+        continue
+
+      phrase = _normalize_text(" ".join(span_tokens[:20]))
+      if len(phrase) < 50 or phrase in seen_phrases:
+        continue
+
+      seen_phrases.add(phrase)
+      probe_phrases.append(phrase)
+      if len(probe_phrases) >= 6:
+        break
+
+    if len(probe_phrases) < 4:
+      for span in probe_spans:
+        span_tokens = list(span.get("tokens", []))
+        if len(span_tokens) < 10:
+          continue
+
+        phrase = _normalize_text(" ".join(span_tokens[:20]))
+        if len(phrase) < 50 or phrase in seen_phrases:
+          continue
+
+        seen_phrases.add(phrase)
+        probe_phrases.append(phrase)
+        if len(probe_phrases) >= 6:
+          break
+
+  return {
+    "cleaned_source": cleaned_source,
+    "normalized_source": normalized_source,
+    "source_terms": source_terms,
+    "source_sample": source_sample,
+    "source_chargrams": source_chargrams,
+    "headline_norm": headline_norm,
+    "probe_phrases": probe_phrases,
+  }
+
+
+def _reference_overlap_score(
+  reference: Dict[str, str],
+  profile: Dict[str, object],
+) -> float:
+  cleaned_source = str(profile.get("cleaned_source", ""))
+  normalized_source = str(profile.get("normalized_source", ""))
+  if not cleaned_source or not normalized_source:
+    return 0.0
+
+  reference_text = _repair_character_spaced_text(
+    _normalize_extracted_text(reference.get("text", ""))
+  ).strip()
+  if not reference_text:
+    return 0.0
+
+  normalized_reference = _normalize_text(reference_text)
+  if not normalized_reference:
+    return 0.0
+
+  reference_tokens = normalized_reference.split()
+  reference_terms = set(_content_tokens(reference_tokens[:2200]))
+  source_terms = set(profile.get("source_terms", set()))
+  concept_overlap = _set_jaccard_similarity(source_terms, reference_terms)
+
+  source_sample = str(profile.get("source_sample", ""))
+  reference_sample = normalized_reference[:3200]
+  source_chargrams = profile.get("source_chargrams", Counter())
+  if not isinstance(source_chargrams, Counter):
+    source_chargrams = Counter()
+
+  char_overlap = _counter_cosine_similarity(
+    source_chargrams,
+    _char_ngrams(reference_sample, n=4),
+  )
+  leading_sequence = SequenceMatcher(
+    None,
+    source_sample,
+    reference_sample,
+    autojunk=False,
+  ).ratio()
+
+  headline_norm = str(profile.get("headline_norm", ""))
+  title_norm = _normalize_text(reference.get("title", ""))
+  title_alignment = (
+    SequenceMatcher(None, headline_norm, title_norm, autojunk=False).ratio()
+    if headline_norm and title_norm
+    else 0.0
+  )
+
+  probe_phrases = list(profile.get("probe_phrases", []))
+  phrase_hits = sum(1 for phrase in probe_phrases if phrase and phrase in normalized_reference)
+  phrase_ratio = phrase_hits / max(1.0, float(len(probe_phrases)))
+
+  score = (
+    (0.42 * phrase_ratio)
+    + (0.22 * concept_overlap)
+    + (0.16 * char_overlap)
+    + (0.12 * leading_sequence)
+    + (0.08 * title_alignment)
+  )
+  return max(0.0, min(100.0, score * 100.0))
+
+
+def _rank_reference_candidates_by_overlap(
+  source_text: str,
+  references: Sequence[Dict[str, str]],
+) -> List[Dict[str, str]]:
+  if not references:
+    return []
+
+  profile = _build_source_overlap_profile(source_text)
+  if not str(profile.get("normalized_source", "")):
+    return list(references)
+
+  scored: List[Tuple[float, int, int, Dict[str, str]]] = []
+  for index, reference in enumerate(references):
+    score = _reference_overlap_score(reference, profile)
+    text_length = len(_collapse_whitespace(reference.get("text", "")))
+    scored.append((score, text_length, -index, reference))
+
+  best_score = max((value[0] for value in scored), default=0.0)
+  if best_score <= 0.0:
+    return list(references)
+
+  scored.sort(key=lambda value: (value[0], value[1], value[2]), reverse=True)
+  return [value[3] for value in scored]
+
+
 def _fetch_firsthand_web_sources(
   queries: Sequence[str],
   timeout: int,
@@ -529,6 +769,9 @@ def _fetch_firsthand_web_sources(
     ("Wikipedia", fetch_wikipedia_results),
   )
   accept_score_floor = 1.5
+  provider_query_limit = max(8, max_results * 3)
+  provider_pool_limit = min(24, max(provider_query_limit, max_results * max(3, len(queries))))
+  shortlisted_limit = max(max_results * 2, 6)
 
   for source_name, provider in providers:
     _emit_progress(progress_callback, f"Collecting web sources: {source_name}")
@@ -538,7 +781,7 @@ def _fetch_firsthand_web_sources(
       try:
         fetched = provider(
           query,
-          max_results=max_results,
+          max_results=provider_query_limit,
           timeout=min(timeout, 7),
         )
       except Exception as exc:
@@ -549,13 +792,19 @@ def _fetch_firsthand_web_sources(
         continue
 
       source_results.extend(fetched)
-      source_results = _deduplicate_reference_items(source_results, max_results=max_results)
-      if len(source_results) >= max_results:
+      source_results = _deduplicate_reference_items(source_results, max_results=provider_pool_limit)
+      if len(source_results) >= provider_pool_limit:
         break
 
-    source_results = _deduplicate_reference_items(source_results, max_results=max_results)
+    source_results = _deduplicate_reference_items(source_results, max_results=provider_pool_limit)
     if not source_results:
       continue
+
+    if source_text:
+      source_results = _rank_reference_candidates_by_overlap(source_text, source_results)
+      source_results = source_results[:shortlisted_limit]
+    else:
+      source_results = source_results[:max_results]
 
     if not source_text:
       return source_results, best_fallback, issues, source_name, best_fallback_source, best_fallback_score
@@ -703,6 +952,87 @@ def _classify_match(score: float) -> str:
 def _strip_html_text(text: str) -> str:
   text = TAG_RE.sub(" ", text or "")
   return _collapse_whitespace(unescape(text))
+
+
+def _extract_main_html_text(html_text: str) -> str:
+  """Extract the most article-like text block from raw HTML."""
+  if not html_text:
+    return ""
+
+  cleaned_html = re.sub(
+    r"<(script|style|noscript|svg|header|footer|nav|aside)[^>]*>.*?</\1>",
+    " ",
+    html_text,
+    flags=re.IGNORECASE | re.DOTALL,
+  )
+
+  candidates: List[Tuple[float, str]] = []
+  patterns = [
+    r"<article[^>]*>(.*?)</article>",
+    r"<main[^>]*>(.*?)</main>",
+    r"<section[^>]+(?:id|class)=['\"][^'\"]*(?:article|content|main|post|entry|story|body)[^'\"]*['\"][^>]*>(.*?)</section>",
+    r"<div[^>]+(?:id|class)=['\"][^'\"]*(?:article|content|main|post|entry|story|body)[^'\"]*['\"][^>]*>(.*?)</div>",
+  ]
+
+  for pattern in patterns:
+    for block in re.findall(pattern, cleaned_html, flags=re.IGNORECASE | re.DOTALL):
+      block_text = _strip_html_text(block)
+      if len(block_text) < 320:
+        continue
+
+      paragraph_count = len(re.findall(r"<p\b", block, flags=re.IGNORECASE))
+      heading_count = len(re.findall(r"<h[1-3]\b", block, flags=re.IGNORECASE))
+      score = len(block_text) + (paragraph_count * 220) + (heading_count * 120)
+      candidates.append((float(score), block_text))
+
+  # Some pages load article content via JSON blobs; capture articleBody/text fields.
+  script_blocks = re.findall(
+    r"<script[^>]*>(.*?)</script>",
+    html_text,
+    flags=re.IGNORECASE | re.DOTALL,
+  )
+  for script in script_blocks:
+    if "articleBody" not in script and '"text"' not in script:
+      continue
+
+    for pattern in (
+      r'"articleBody"\s*:\s*"((?:\\.|[^"\\])+)"',
+      r'"text"\s*:\s*"((?:\\.|[^"\\])+)"',
+    ):
+      for encoded in re.findall(pattern, script, flags=re.IGNORECASE | re.DOTALL):
+        try:
+          decoded = bytes(encoded, "utf-8").decode("unicode_escape", errors="ignore")
+        except Exception:
+          decoded = encoded
+
+        candidate_text = _collapse_whitespace(unescape(decoded))
+        if len(candidate_text) < 320:
+          continue
+
+        score = len(candidate_text) + 800.0
+        candidates.append((score, candidate_text))
+
+  if candidates:
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+  return _strip_html_text(cleaned_html)
+
+
+def _distributed_text_sample(text: str, max_chars: int = 22000) -> str:
+  """Return a start/middle/end sample to retain deep content while staying fast."""
+  cleaned = _collapse_whitespace(text)
+  if len(cleaned) <= max_chars:
+    return cleaned
+
+  segment_chars = max(900, max_chars // 3)
+  start_segment = cleaned[:segment_chars]
+  middle_start = max(0, (len(cleaned) // 2) - (segment_chars // 2))
+  middle_segment = cleaned[middle_start : middle_start + segment_chars]
+  end_segment = cleaned[-segment_chars:]
+
+  merged = " ".join(part for part in (start_segment, middle_segment, end_segment) if part)
+  return merged[:max_chars]
 
 
 def _openalex_abstract_from_index(inverted_index: Dict[str, List[int]]) -> str:
@@ -995,12 +1325,20 @@ def _extract_pdf_text_from_bytes(
   except Exception:
     return ""
 
+  total_pages = len(reader.pages)
+  if total_pages <= max_pages:
+    page_indexes = list(range(total_pages))
+  else:
+    step = (total_pages - 1) / max(1, max_pages - 1)
+    page_indexes = sorted({int(round(position * step)) for position in range(max_pages)})
+
   chunks: List[str] = []
   char_count = 0
-  for page_index, page in enumerate(reader.pages):
-    if page_index >= max_pages or char_count >= max_chars:
+  for page_index in page_indexes:
+    if char_count >= max_chars:
       break
 
+    page = reader.pages[page_index]
     extracted = _normalize_extracted_text(page.extract_text() or "")
     cleaned = _collapse_whitespace(extracted)
     if len(cleaned) < 20:
@@ -1035,6 +1373,7 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
       max_pages=60,
       max_chars=30000,
     )
+    pdf_text = _distributed_text_sample(pdf_text, max_chars=26000)
     if len(pdf_text) < 180:
       return None, "Unable to extract enough readable text from the PDF URL."
 
@@ -1056,13 +1395,8 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
   )
   title = _strip_html_text(title_match.group(1)) if title_match else url
 
-  html_text = re.sub(
-    r"<(script|style)[^>]*>.*?</\1>",
-    " ",
-    html_text,
-    flags=re.IGNORECASE | re.DOTALL,
-  )
-  text_content = _strip_html_text(html_text)
+  text_content = _extract_main_html_text(html_text)
+  text_content = _distributed_text_sample(text_content, max_chars=26000)
 
   if len(text_content) < 180:
     return None, "The URL does not contain enough readable text for comparison."
@@ -1071,7 +1405,7 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
     {
       "title": title or url,
       "url": url,
-      "text": text_content[:18000],
+      "text": text_content,
       "source": "URL Import",
     },
     "URL source imported successfully.",
@@ -1109,6 +1443,7 @@ def _fetch_readable_text_from_url(
       max_pages=40,
       max_chars=max_chars,
     )
+    extracted = _distributed_text_sample(extracted, max_chars=max_chars)
     if len(extracted) < 260:
       return "", ""
 
@@ -1125,17 +1460,11 @@ def _fetch_readable_text_from_url(
   )
   title = _strip_html_text(title_match.group(1)) if title_match else ""
 
-  html_text = re.sub(
-    r"<(script|style|noscript|svg)[^>]*>.*?</\1>",
-    " ",
-    html_text,
-    flags=re.IGNORECASE | re.DOTALL,
-  )
-  text_content = _strip_html_text(html_text)
+  text_content = _extract_main_html_text(html_text)
   if len(text_content) < 260:
     return title, ""
 
-  return title, text_content[:max_chars]
+  return title, _distributed_text_sample(text_content, max_chars=max_chars)
 
 
 def _expand_web_references_with_page_text(
@@ -1158,7 +1487,7 @@ def _expand_web_references_with_page_text(
       _emit_progress(progress_callback, f"Expanding web pages ({index}/{total})")
       page_title, page_text = _fetch_readable_text_from_url(
         url,
-        timeout=min(timeout, 8),
+        timeout=min(timeout, 10),
       )
       if len(page_text) >= 260:
         if snippet_text:
@@ -1213,10 +1542,14 @@ def fetch_web_reference_texts(
     max_results=max(1, min(3, max_results)),
     progress_callback=progress_callback,
   )
-  web_results = _deduplicate_reference_items(
-    web_results,
-    max_results=max(1, min(3, max_results)),
-  )
+
+  limit = max(1, min(3, max_results))
+  expansion_limit = max(limit * 2, 6)
+
+  web_results = _deduplicate_reference_items(web_results)
+  if cleaned_source_text and web_results:
+    web_results = _rank_reference_candidates_by_overlap(cleaned_source_text, web_results)
+  web_results = web_results[:expansion_limit]
 
   if web_results:
     web_results, expanded_pages = _expand_web_references_with_page_text(
@@ -1224,6 +1557,11 @@ def fetch_web_reference_texts(
       timeout=timeout,
       progress_callback=progress_callback,
     )
+
+    web_results = _deduplicate_reference_items(web_results)
+    if cleaned_source_text:
+      web_results = _rank_reference_candidates_by_overlap(cleaned_source_text, web_results)
+    web_results = web_results[:limit]
   else:
     expanded_pages = 0
 
@@ -1402,7 +1740,13 @@ def fetch_reference_texts(
     max_results=3,
     progress_callback=progress_callback,
   )
-  web_results = _deduplicate_reference_items(web_results, max_results=3)
+
+  web_results = _deduplicate_reference_items(web_results)
+  if source_text and web_results:
+    web_results = _rank_reference_candidates_by_overlap(source_text, web_results)
+
+  web_expansion_limit = 6
+  web_results = web_results[:web_expansion_limit]
 
   if web_results:
     web_results, expanded_pages = _expand_web_references_with_page_text(
@@ -1410,6 +1754,11 @@ def fetch_reference_texts(
       timeout=timeout,
       progress_callback=progress_callback,
     )
+
+    web_results = _deduplicate_reference_items(web_results)
+    if source_text:
+      web_results = _rank_reference_candidates_by_overlap(source_text, web_results)
+    web_results = web_results[:3]
   else:
     expanded_pages = 0
 
@@ -1513,15 +1862,87 @@ def _offline_self_overlap_result(
   }
 
 
+def _merge_char_ranges(
+  ranges: Sequence[Tuple[int, int]],
+  max_length: int,
+) -> List[Tuple[int, int]]:
+  normalized: List[Tuple[int, int]] = []
+  for start, end in ranges:
+    left = max(0, min(int(start), max_length))
+    right = max(0, min(int(end), max_length))
+    if right <= left:
+      continue
+    normalized.append((left, right))
+
+  if not normalized:
+    return []
+
+  normalized.sort(key=lambda value: (value[0], value[1]))
+  merged: List[List[int]] = [[normalized[0][0], normalized[0][1]]]
+  for start, end in normalized[1:]:
+    current = merged[-1]
+    if start <= current[1]:
+      current[1] = max(current[1], end)
+    else:
+      merged.append([start, end])
+
+  return [(start, end) for start, end in merged]
+
+
+def _matching_char_ranges(
+  left_text: str,
+  right_text: str,
+  min_chars: int = 18,
+) -> List[Tuple[int, int]]:
+  if not left_text or not right_text:
+    return []
+
+  matcher = SequenceMatcher(None, left_text.lower(), right_text.lower(), autojunk=False)
+  blocks = matcher.get_matching_blocks()
+  ranges = [
+    (block.a, block.a + block.size)
+    for block in blocks
+    if block.size >= min_chars
+  ]
+  return _merge_char_ranges(ranges, len(left_text))
+
+
+def _paragraph_match_score(
+  target_paragraph: Dict[str, object],
+  reference_paragraph: Dict[str, object],
+  source_prior: float,
+) -> Tuple[float, Dict[str, float], float]:
+  base_score, parts = _span_similarity(target_paragraph, reference_paragraph)
+
+  seq_matcher = SequenceMatcher(
+    None,
+    str(target_paragraph.get("norm", "")),
+    str(reference_paragraph.get("norm", "")),
+    autojunk=False,
+  )
+  longest_block = max((block.size for block in seq_matcher.get_matching_blocks()), default=0)
+  longest_ratio = longest_block / max(1.0, len(str(target_paragraph.get("norm", ""))))
+
+  target_ngrams = set(target_paragraph.get("ngrams", set()))
+  reference_ngrams = set(reference_paragraph.get("ngrams", set()))
+  ngram_overlap = _set_jaccard_similarity(target_ngrams, reference_ngrams)
+
+  score = (0.68 * base_score) + (0.20 * longest_ratio) + (0.12 * ngram_overlap)
+  score *= (0.92 + (0.16 * max(0.0, min(1.0, source_prior))))
+  score = max(0.0, min(1.0, score))
+
+  return score, parts, longest_ratio
+
+
 def analyze_text_against_references(
   text: str,
   references: Sequence[Dict[str, str]],
-  min_score: float = 0.66,
-  max_matches: int = 12,
+  min_score: float = 0.58,
+  max_matches: int = 0,
   progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, object]:
   """
-  Compare text to external references with hybrid scoring over words, sentences, and paragraphs.
+  Compare text to external references with paragraph-first hybrid scoring.
   Returns data ready for UI presentation.
   """
   cleaned_text = _repair_character_spaced_text(
@@ -1535,17 +1956,18 @@ def analyze_text_against_references(
       "note": "No text provided.",
     }
 
-  _emit_progress(progress_callback, "Extracting text spans")
+  _emit_progress(progress_callback, "Extracting paragraph spans")
   target_sentences = _sentence_spans(cleaned_text, min_words=3)
-  target_paragraphs = _paragraph_spans(cleaned_text, min_words=8)
-  _assign_paragraph_ids(target_sentences, target_paragraphs)
+  target_paragraphs = _paragraph_spans(cleaned_text, min_words=6)
+  if not target_paragraphs and target_sentences:
+    target_paragraphs = list(target_sentences)
 
-  if not target_sentences:
+  if not target_paragraphs:
     return {
       "plagiarized_contents": {},
       "data": [0.0, 100.0],
       "mode": "empty",
-      "note": "No valid sentence spans found in the input text.",
+      "note": "No valid paragraph spans found in the input text.",
     }
 
   if not references:
@@ -1556,10 +1978,11 @@ def analyze_text_against_references(
     )
 
   _emit_progress(progress_callback, "Building source index")
-  reference_sentences: List[Dict[str, object]] = []
   reference_paragraphs: List[Dict[str, object]] = []
   ngram_index = defaultdict(set)
   concept_index = defaultdict(set)
+  source_concepts: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
+  source_norm_text: Dict[Tuple[str, str, str], str] = {}
   total_references = len(references)
   ref_progress_step = max(1, total_references // 5)
 
@@ -1577,129 +2000,202 @@ def analyze_text_against_references(
     reference_text = _repair_character_spaced_text(
       _normalize_extracted_text(reference.get("text", ""))
     )
-    ref_paragraphs = _paragraph_spans(reference_text, min_words=8)
-    ref_sentences = _sentence_spans(reference_text, min_words=3)
-    _assign_paragraph_ids(ref_sentences, ref_paragraphs)
+    source_key_base = (title, url, source_name)
+    if source_key_base not in source_norm_text:
+      source_norm_text[source_key_base] = _normalize_text(reference_text)[:300000]
 
-    paragraph_offset = len(reference_paragraphs)
+    ref_paragraphs = _paragraph_spans(reference_text, min_words=6)
+    if not ref_paragraphs:
+      ref_paragraphs = _sentence_spans(reference_text, min_words=3)
+
     for paragraph in ref_paragraphs:
       paragraph["title"] = title
       paragraph["url"] = url
       paragraph["source_name"] = source_name
+      paragraph["source_key"] = source_key_base
+
+      reference_index = len(reference_paragraphs)
       reference_paragraphs.append(paragraph)
 
-    for sentence in ref_sentences:
-      sentence["title"] = title
-      sentence["url"] = url
-      sentence["source_name"] = source_name
+      for ngram in paragraph.get("ngrams", set()):
+        ngram_index[ngram].add(reference_index)
+      for concept in paragraph.get("concept_set", set()):
+        concept_index[concept].add(reference_index)
 
-      paragraph_id = int(sentence.get("paragraph_id", -1))
-      if paragraph_id >= 0:
-        sentence["paragraph_id"] = paragraph_offset + paragraph_id
+      source_key = paragraph.get("source_key")
+      if isinstance(source_key, tuple) and len(source_key) == 3:
+        source_concepts[source_key].update(set(paragraph.get("concept_set", set())))
 
-      ref_index = len(reference_sentences)
-      reference_sentences.append(sentence)
-
-      for ngram in sentence["ngrams"]:
-        ngram_index[ngram].add(ref_index)
-      for concept in sentence["concept_set"]:
-        concept_index[concept].add(ref_index)
-
-  if not reference_sentences:
+  if not reference_paragraphs:
     return _offline_self_overlap_result(
       cleaned_text,
       target_sentences,
-      note="Loaded references had no extractable sentence content.",
+      note="Loaded references had no extractable paragraph content.",
     )
 
-  _emit_progress(progress_callback, "Checking against sources")
-  all_matches: List[Dict[str, object]] = []
-  total_sentences = len(target_sentences)
-  sentence_progress_step = max(8, total_sentences // 10)
+  target_doc_concepts: Set[str] = set()
+  for paragraph in target_paragraphs[:260]:
+    target_doc_concepts.update(set(paragraph.get("concept_set", set())))
 
-  for sentence_index, sentence in enumerate(target_sentences, start=1):
+  source_prior: Dict[Tuple[str, str, str], float] = {}
+  for key, concepts in source_concepts.items():
+    source_prior[key] = _set_jaccard_similarity(target_doc_concepts, concepts)
+
+  _emit_progress(progress_callback, "Checking paragraphs against sources")
+  all_matches: List[Dict[str, object]] = []
+  total_paragraphs = len(target_paragraphs)
+  paragraph_progress_step = max(6, total_paragraphs // 10)
+
+  for paragraph_index, paragraph in enumerate(target_paragraphs, start=1):
     if (
-      sentence_index == 1
-      or sentence_index % sentence_progress_step == 0
-      or sentence_index == total_sentences
+      paragraph_index == 1
+      or paragraph_index % paragraph_progress_step == 0
+      or paragraph_index == total_paragraphs
     ):
       _emit_progress(
         progress_callback,
-        f"Checking against sources ({sentence_index}/{total_sentences})",
+        f"Checking against sources ({paragraph_index}/{total_paragraphs})",
       )
 
     candidate_counter = Counter()
-    for ngram in sentence["ngrams"]:
+    for ngram in paragraph.get("ngrams", set()):
       for ref_idx in ngram_index.get(ngram, set()):
         candidate_counter[ref_idx] += 3
 
-    for concept in sentence["concept_set"]:
+    for concept in paragraph.get("concept_set", set()):
       for ref_idx in concept_index.get(concept, set()):
         candidate_counter[ref_idx] += 1
 
     if not candidate_counter:
       continue
 
-    # Filter to candidates with sufficient overlap (performance optimization)
-    # At least 2 n-gram or 4 concept hits to be worth detailed evaluation
-    viable_candidates = [(idx, hits) for idx, hits in candidate_counter.most_common(35) if hits >= 2]
-    
+    viable_candidates = [
+      (idx, hits)
+      for idx, hits in candidate_counter.most_common(48)
+      if hits >= 2
+    ]
+
     if not viable_candidates:
       continue
 
     best_score = 0.0
     best_reference: Optional[Dict[str, object]] = None
-    sentence_parts: Dict[str, float] = {}
-    paragraph_parts: Dict[str, float] = {}
+    best_parts: Dict[str, float] = {}
+    best_longest_ratio = 0.0
+    best_ranges: List[Tuple[int, int]] = []
+    best_source_key: Tuple[str, str, str] = ("", "", "")
+    candidate_records: List[Dict[str, object]] = []
 
-    target_paragraph: Optional[Dict[str, object]] = None
-    target_paragraph_id = int(sentence.get("paragraph_id", -1))
-    if 0 <= target_paragraph_id < len(target_paragraphs):
-      target_paragraph = target_paragraphs[target_paragraph_id]
-
-    # Evaluate likely candidate sentences; include paragraph-context scoring.
-    # Reduced from 80 to 35 candidates for better performance.
     for ref_idx, _hits in viable_candidates:
-      ref_sentence = reference_sentences[ref_idx]
-      sent_score, sent_parts = _span_similarity(sentence, ref_sentence)
-      
-      # Early exit if sentence score is too low to matter
-      if sent_score < (min_score * 0.8):
+      reference_paragraph = reference_paragraphs[ref_idx]
+      source_key = reference_paragraph.get("source_key")
+      source_weight = source_prior.get(source_key, 0.0) if isinstance(source_key, tuple) else 0.0
+
+      score, parts, longest_ratio = _paragraph_match_score(
+        paragraph,
+        reference_paragraph,
+        source_weight,
+      )
+      if score < (min_score * 0.82):
         continue
 
-      paragraph_score = 0.0
-      current_paragraph_parts: Dict[str, float] = {}
-      ref_paragraph_id = int(ref_sentence.get("paragraph_id", -1))
-      if target_paragraph is not None and 0 <= ref_paragraph_id < len(reference_paragraphs):
-        ref_paragraph = reference_paragraphs[ref_paragraph_id]
-        paragraph_score, current_paragraph_parts = _span_similarity(target_paragraph, ref_paragraph)
+      ranges = _matching_char_ranges(
+        str(paragraph.get("raw", "")),
+        str(reference_paragraph.get("raw", "")),
+        min_chars=16,
+      )
 
-      # Combine sentence-level alignment with paragraph-level context consistency.
-      score = (0.72 * sent_score) + (0.28 * paragraph_score)
-
-      if score > best_score:
-        best_score = score
-        best_reference = ref_sentence
-        sentence_parts = sent_parts
-        paragraph_parts = current_paragraph_parts
-
-    if best_reference and best_score >= min_score:
-      source_title = f"{best_reference['title']} ({best_reference['source_name']})"
-      all_matches.append(
+      candidate_records.append(
         {
-          "plagiarized_paragraph": sentence["raw"],
-          "match_type": _classify_match(best_score),
-          "source": (source_title, best_reference.get("url", "")),
-          "text_start": sentence["start"],
-          "text_end": sentence["end"],
-          "score": round(best_score * 100, 1),
-          "sentence_cosine": round(sentence_parts.get("token_cos", 0.0) * 100, 1),
-          "sentence_sequence": round(sentence_parts.get("sequence", 0.0) * 100, 1),
-          "paragraph_context": round(paragraph_parts.get("token_cos", 0.0) * 100, 1),
+          "reference": reference_paragraph,
+          "source_key": source_key if isinstance(source_key, tuple) else ("", "", ""),
+          "score": score,
+          "parts": parts,
+          "longest_ratio": longest_ratio,
+          "ranges": ranges,
         }
       )
 
-  all_matches.sort(key=lambda value: value["score"], reverse=True)
+      if score > best_score:
+        best_score = score
+        best_reference = reference_paragraph
+        best_parts = parts
+        best_longest_ratio = longest_ratio
+        best_ranges = ranges
+        if isinstance(source_key, tuple):
+          best_source_key = source_key
+
+    if best_reference and best_score >= min_score:
+      if best_source_key != ("", "", ""):
+        aggregated_ranges: List[Tuple[int, int]] = []
+        for candidate in candidate_records:
+          candidate_source = candidate.get("source_key", ("", "", ""))
+          candidate_score = float(candidate.get("score", 0.0))
+          if candidate_source != best_source_key:
+            continue
+          if candidate_score < max(min_score * 0.86, best_score * 0.42):
+            continue
+          aggregated_ranges.extend(candidate.get("ranges", []))
+
+        if aggregated_ranges:
+          best_ranges = _merge_char_ranges(
+            aggregated_ranges,
+            len(str(paragraph.get("raw", ""))),
+          )
+
+        paragraph_norm = str(paragraph.get("norm", ""))
+        source_blob = source_norm_text.get(best_source_key, "")
+        if len(paragraph_norm) >= 40 and paragraph_norm and paragraph_norm in source_blob:
+          best_ranges = [(0, len(str(paragraph.get("raw", ""))))]
+          best_score = max(best_score, 0.97)
+
+      paragraph_text = str(paragraph.get("raw", ""))
+      paragraph_length = max(1, len(paragraph_text))
+      matched_chars = sum((end - start) for start, end in best_ranges)
+      coverage_ratio = matched_chars / paragraph_length
+
+      if (not best_ranges and best_score >= 0.84) or (coverage_ratio < 0.22 and best_score >= 0.90):
+        best_ranges = [(0, paragraph_length)]
+        matched_chars = paragraph_length
+        coverage_ratio = 1.0
+
+      source_title = f"{best_reference['title']} ({best_reference['source_name']})"
+      source_key = best_reference.get("source_key")
+      source_relevance = source_prior.get(source_key, 0.0) if isinstance(source_key, tuple) else 0.0
+
+      absolute_ranges: List[Tuple[int, int]] = []
+      paragraph_start = int(paragraph.get("start", 0))
+      paragraph_end = int(paragraph.get("end", paragraph_start + paragraph_length))
+      for start, end in best_ranges:
+        abs_start = paragraph_start + start
+        abs_end = min(paragraph_end, paragraph_start + end)
+        if abs_end > abs_start:
+          absolute_ranges.append((abs_start, abs_end))
+
+      all_matches.append(
+        {
+          "plagiarized_paragraph": paragraph_text,
+          "match_type": _classify_match(best_score),
+          "source": (source_title, best_reference.get("url", "")),
+          "text_start": paragraph_start,
+          "text_end": paragraph_end,
+          "highlight_ranges": [(int(start), int(end)) for start, end in best_ranges],
+          "absolute_ranges": [(int(start), int(end)) for start, end in absolute_ranges],
+          "source_excerpt": str(best_reference.get("raw", ""))[:1400],
+          "coverage_ratio": round(coverage_ratio * 100, 1),
+          "source_relevance": round(source_relevance * 100, 1),
+          "score": round(best_score * 100, 1),
+          "token_cosine": round(best_parts.get("token_cos", 0.0) * 100, 1),
+          "sequence": round(best_parts.get("sequence", 0.0) * 100, 1),
+          "concept_overlap": round(best_parts.get("concept", 0.0) * 100, 1),
+          "longest_block": round(best_longest_ratio * 100, 1),
+        }
+      )
+
+  all_matches.sort(
+    key=lambda value: (float(value.get("coverage_ratio", 0.0)), float(value.get("score", 0.0))),
+    reverse=True,
+  )
 
   if max_matches <= 0:
     display_matches = all_matches
@@ -1707,15 +2203,21 @@ def analyze_text_against_references(
     display_matches = all_matches[:max_matches]
 
   _emit_progress(progress_callback, "Cleaning up results")
-  # Coverage uses all detected matches, not only the displayed top-N list.
   coverage = [0] * len(cleaned_text)
+
   for match in all_matches:
-    for index in range(match["text_start"], min(match["text_end"], len(cleaned_text))):
+    absolute_ranges = match.get("absolute_ranges") or []
+    if absolute_ranges:
+      for start, end in absolute_ranges:
+        for index in range(max(0, int(start)), min(int(end), len(cleaned_text))):
+          coverage[index] = 1
+      continue
+
+    for index in range(int(match["text_start"]), min(int(match["text_end"]), len(cleaned_text))):
       coverage[index] = 1
 
   plag_percent = round((sum(coverage) / max(1, len(cleaned_text))) * 100, 1)
   if all_matches and plag_percent == 0.0:
-    # Avoid presenting 0.0 when overlaps exist but the document is very large.
     plag_percent = 0.1
   original_percent = round(max(0.0, 100 - plag_percent), 1)
 
@@ -1724,8 +2226,8 @@ def analyze_text_against_references(
   }
 
   note = (
-    "Compared against external references with hybrid word/sentence/paragraph scoring. "
-    f"Detected {len(all_matches)} matching spans."
+    "Compared against external references with paragraph-first hybrid scoring. "
+    f"Detected {len(all_matches)} matching paragraphs."
   )
   if max_matches > 0 and len(all_matches) > len(display_matches):
     note += f" Showing top {len(display_matches)} in the UI."
