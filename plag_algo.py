@@ -12,6 +12,11 @@ import requests
 from PyPDF2 import PdfReader
 from docx import Document
 
+try:
+  import fitz  # PyMuPDF
+except Exception:
+  fitz = None
+
 
 WORD_RE = re.compile(r"[A-Za-z0-9']+")
 SENTENCE_RE = re.compile(r"[^.!?\n]+[.!?]?")
@@ -116,6 +121,152 @@ def _normalize_extracted_text(text: str) -> str:
   # Remove isolated page-number lines.
   normalized = re.sub(r"(?m)^\s*\d{1,4}\s*$", "", normalized)
   return normalized
+
+
+def _clean_pdf_block(text: str) -> str:
+  """Normalize PDF text while preserving paragraph breaks."""
+  normalized = _normalize_extracted_text(text)
+  if not normalized:
+    return ""
+
+  normalized = re.sub(r"[ \t]+", " ", normalized)
+  normalized = re.sub(r" *\n *", "\n", normalized)
+  normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+  return normalized.strip()
+
+
+def _sample_page_indexes(total_pages: int, max_pages: int) -> List[int]:
+  if total_pages <= 0:
+    return []
+
+  capped_pages = max(1, int(max_pages or 1))
+  if total_pages <= capped_pages:
+    return list(range(total_pages))
+
+  step = (total_pages - 1) / max(1, capped_pages - 1)
+  return sorted({int(round(position * step)) for position in range(capped_pages)})
+
+
+def _extract_pdf_page_text_with_pymupdf(page: object) -> str:
+  """Rebuild readable page text from PyMuPDF words to reduce split-word artifacts."""
+  try:
+    words = page.get_text("words") or []
+  except Exception:
+    words = []
+
+  if words:
+    try:
+      sorted_words = sorted(
+        words,
+        key=lambda row: (round(float(row[1]), 1), float(row[0])),
+      )
+    except Exception:
+      sorted_words = words
+
+    lines: List[str] = []
+    current_tokens: List[str] = []
+    current_y: Optional[float] = None
+    y_tolerance = 2.2
+
+    for row in sorted_words:
+      if len(row) < 5:
+        continue
+
+      word = _collapse_whitespace(str(row[4]))
+      if not word:
+        continue
+
+      y0 = float(row[1])
+      if current_y is None or abs(y0 - current_y) <= y_tolerance:
+        current_tokens.append(word)
+        current_y = y0 if current_y is None else ((current_y * 0.7) + (y0 * 0.3))
+      else:
+        line_text = " ".join(current_tokens).strip()
+        if line_text:
+          lines.append(line_text)
+        current_tokens = [word]
+        current_y = y0
+
+    if current_tokens:
+      line_text = " ".join(current_tokens).strip()
+      if line_text:
+        lines.append(line_text)
+
+    rebuilt = "\n".join(lines).strip()
+    if len(rebuilt) >= 20:
+      return rebuilt
+
+  try:
+    return page.get_text("text") or ""
+  except Exception:
+    return ""
+
+
+def _extract_pdf_text_with_pymupdf(
+  source: object,
+  *,
+  from_bytes: bool,
+  max_pages: int,
+  max_chars: int,
+) -> str:
+  if fitz is None:
+    return ""
+
+  try:
+    if from_bytes:
+      document = fitz.open(stream=source, filetype="pdf")
+    else:
+      document = fitz.open(source)
+  except Exception:
+    return ""
+
+  try:
+    total_pages = int(getattr(document, "page_count", 0) or 0)
+    if total_pages <= 0:
+      return ""
+
+    if max_pages and max_pages > 0:
+      page_indexes = _sample_page_indexes(total_pages, max_pages=max_pages)
+    else:
+      page_indexes = list(range(total_pages))
+
+    chunks: List[str] = []
+    char_count = 0
+    hard_cap = max(0, int(max_chars or 0))
+
+    for page_index in page_indexes:
+      if hard_cap and char_count >= hard_cap:
+        break
+
+      try:
+        page = document.load_page(page_index)
+      except Exception:
+        continue
+
+      extracted = _extract_pdf_page_text_with_pymupdf(page)
+      cleaned = _clean_pdf_block(extracted)
+      if len(cleaned) < 20:
+        continue
+
+      if hard_cap:
+        remaining = hard_cap - char_count
+        if remaining <= 0:
+          break
+        piece = cleaned[:remaining]
+      else:
+        piece = cleaned
+
+      chunks.append(piece)
+      char_count += len(piece)
+
+    merged = "\n\n".join(chunks).strip()
+    merged = _repair_character_spaced_text(_clean_pdf_block(merged))
+    return merged.strip()
+  finally:
+    try:
+      document.close()
+    except Exception:
+      pass
 
 
 def _simple_stem(token: str) -> str:
@@ -339,8 +490,15 @@ def process_file(file_path: str) -> str:
       doc = Document(file_path)
       content = "\n".join(para.text for para in doc.paragraphs)
     elif file_path.endswith(".pdf"):
-      reader = PdfReader(file_path)
-      content = "\n".join((page.extract_text() or "") for page in reader.pages)
+      content = _extract_pdf_text_with_pymupdf(
+        file_path,
+        from_bytes=False,
+        max_pages=0,
+        max_chars=0,
+      )
+      if len(_collapse_whitespace(content)) < 120:
+        reader = PdfReader(file_path)
+        content = "\n".join((page.extract_text() or "") for page in reader.pages)
     else:
       return ""
   except Exception:
@@ -405,6 +563,48 @@ def _emit_progress(
     pass
 
 
+def _is_search_noise_paragraph(paragraph: str) -> bool:
+  """Detect metadata-heavy blocks that should not drive web query generation."""
+  compact = _collapse_whitespace(paragraph)
+  if not compact:
+    return True
+
+  lowered = compact.lower()
+  noisy_markers = (
+    "copyright",
+    "all rights reserved",
+    "isbn",
+    "library of congress",
+    "cataloging",
+    "printed in",
+    "edition",
+    "visit www",
+    "http://",
+    "https://",
+    "www.",
+  )
+  if any(marker in lowered for marker in noisy_markers):
+    return True
+
+  tokens = _tokenize(compact)
+  if not tokens:
+    return True
+
+  token_count = len(tokens)
+  digit_tokens = sum(1 for token in tokens if any(char.isdigit() for char in token))
+  uppercase_tokens = sum(1 for token in compact.split() if token.isupper() and len(token) > 1)
+  avg_token_len = sum(len(token) for token in tokens) / max(1, token_count)
+
+  if (digit_tokens / token_count) >= 0.22:
+    return True
+  if token_count <= 20 and uppercase_tokens >= max(4, token_count // 2):
+    return True
+  if token_count >= 10 and avg_token_len < 3.7 and digit_tokens >= 2:
+    return True
+
+  return False
+
+
 def _build_paragraph_search_queries(
   query: str,
   source_text: str = "",
@@ -419,8 +619,21 @@ def _build_paragraph_search_queries(
   if cleaned_query:
     focus_seed = cleaned_query
   else:
-    leading_tokens = _tokenize(source_text)[:220]
-    focus_seed = " ".join(leading_tokens)
+    leading_tokens: List[str] = []
+    if source_text:
+      for match in PARAGRAPH_RE.finditer(source_text):
+        raw_paragraph = _collapse_whitespace(match.group())
+        if not raw_paragraph or _is_search_noise_paragraph(raw_paragraph):
+          continue
+
+        leading_tokens.extend(_tokenize(raw_paragraph))
+        if len(leading_tokens) >= 220:
+          break
+
+    if not leading_tokens:
+      leading_tokens = _tokenize(source_text)[:220]
+
+    focus_seed = " ".join(leading_tokens[:220])
 
   focus_terms = set(extract_query_keywords(focus_seed, top_k=12).split())
   if cleaned_query:
@@ -432,7 +645,7 @@ def _build_paragraph_search_queries(
     for index, match in enumerate(PARAGRAPH_RE.finditer(source_text)):
       raw_block = match.group()
       raw_paragraph = _collapse_whitespace(raw_block)
-      if not raw_paragraph:
+      if not raw_paragraph or _is_search_noise_paragraph(raw_paragraph):
         continue
 
       tokens = _tokenize(raw_paragraph)
@@ -471,7 +684,7 @@ def _build_paragraph_search_queries(
   if source_text:
     for match in PARAGRAPH_RE.finditer(source_text):
       raw_paragraph = _collapse_whitespace(match.group())
-      if not raw_paragraph:
+      if not raw_paragraph or _is_search_noise_paragraph(raw_paragraph):
         continue
 
       tokens = _tokenize(raw_paragraph)
@@ -1320,17 +1533,22 @@ def _extract_pdf_text_from_bytes(
   if not payload:
     return ""
 
+  pymupdf_text = _extract_pdf_text_with_pymupdf(
+    payload,
+    from_bytes=True,
+    max_pages=max_pages,
+    max_chars=max_chars,
+  )
+  if len(_collapse_whitespace(pymupdf_text)) >= 180:
+    return pymupdf_text
+
   try:
     reader = PdfReader(BytesIO(payload))
   except Exception:
     return ""
 
   total_pages = len(reader.pages)
-  if total_pages <= max_pages:
-    page_indexes = list(range(total_pages))
-  else:
-    step = (total_pages - 1) / max(1, max_pages - 1)
-    page_indexes = sorted({int(round(position * step)) for position in range(max_pages)})
+  page_indexes = _sample_page_indexes(total_pages, max_pages=max_pages)
 
   chunks: List[str] = []
   char_count = 0
@@ -1339,8 +1557,7 @@ def _extract_pdf_text_from_bytes(
       break
 
     page = reader.pages[page_index]
-    extracted = _normalize_extracted_text(page.extract_text() or "")
-    cleaned = _collapse_whitespace(extracted)
+    cleaned = _clean_pdf_block(page.extract_text() or "")
     if len(cleaned) < 20:
       continue
 
@@ -1349,7 +1566,9 @@ def _extract_pdf_text_from_bytes(
     chunks.append(piece)
     char_count += len(piece)
 
-  return "\n".join(chunks).strip()
+  merged = "\n\n".join(chunks).strip()
+  merged = _repair_character_spaced_text(_clean_pdf_block(merged))
+  return merged.strip()
 
 
 def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[str, str]], str]:
@@ -1370,10 +1589,11 @@ def fetch_reference_from_url(url: str, timeout: int = 8) -> Tuple[Optional[Dict[
   if _looks_like_pdf_source(cleaned_url, content_type):
     pdf_text = _extract_pdf_text_from_bytes(
       response.content,
-      max_pages=60,
-      max_chars=30000,
+      max_pages=80,
+      max_chars=36000,
     )
-    pdf_text = _distributed_text_sample(pdf_text, max_chars=26000)
+    if len(pdf_text) > 30000:
+      pdf_text = pdf_text[:30000]
     if len(pdf_text) < 180:
       return None, "Unable to extract enough readable text from the PDF URL."
 
@@ -1438,12 +1658,12 @@ def _fetch_readable_text_from_url(
   content_type = _collapse_whitespace(response.headers.get("Content-Type", "")).lower()
 
   if _looks_like_pdf_source(cleaned_url, content_type):
+    pdf_max_chars = max(max_chars, 52000)
     extracted = _extract_pdf_text_from_bytes(
       response.content,
-      max_pages=40,
-      max_chars=max_chars,
+      max_pages=80,
+      max_chars=pdf_max_chars,
     )
-    extracted = _distributed_text_sample(extracted, max_chars=max_chars)
     if len(extracted) < 260:
       return "", ""
 

@@ -77,7 +77,7 @@ For top web references, the app expands beyond snippets:
 
 - Fetches readable full-page content.
 - Detects PDF sources (`.pdf` URL path or `application/pdf` content type).
-- Extracts PDF text with `PyPDF2` for deeper comparison.
+- Extracts PDF text with `PyMuPDF` first (fallback to `PyPDF2`) for cleaner non-OCR parsing and fewer split-word artifacts.
 - Merges snippet + expanded content to preserve direct search-hit language.
 
 Only up to 3 deduplicated web references are retained in the final blend to keep quality high and noise low.
